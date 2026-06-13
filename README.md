@@ -41,6 +41,9 @@ Deriv options use **fixed stake** = **maximum loss per trade** (e.g. $0.35–$2)
 - 5% daily loss limit (% of balance)
 - 10% max drawdown circuit breaker
 - One open contract at a time
+- **Restart-safe limits** — halt state, daily P&L, anchor balance, and peak balance persist in `data/bot_state.db`. Restarting the bot on the same UTC day cannot bypass a halt.
+
+To manually reset after a halt: `rm data/bot_state.db`
 
 ## Quick Start
 

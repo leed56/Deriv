@@ -1,9 +1,22 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import aiosqlite
+
+
+@dataclass
+class RiskState:
+    trading_day: str
+    anchor_balance: float
+    peak_balance: float
+    realized_pnl_usd: float
+    trades_today: int
+    halted: bool
+    halt_reason: str
+    paper_balance: float
 
 
 class StateStore:
@@ -14,9 +27,17 @@ class StateStore:
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                """CREATE TABLE IF NOT EXISTS daily_pnl (
-                    day TEXT PRIMARY KEY, realized_usd REAL, trades INTEGER,
-                    halted INTEGER, halt_reason TEXT)"""
+                """CREATE TABLE IF NOT EXISTS risk_state (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    trading_day TEXT NOT NULL,
+                    anchor_balance REAL NOT NULL,
+                    peak_balance REAL NOT NULL,
+                    realized_pnl_usd REAL NOT NULL DEFAULT 0,
+                    trades_today INTEGER NOT NULL DEFAULT 0,
+                    halted INTEGER NOT NULL DEFAULT 0,
+                    halt_reason TEXT NOT NULL DEFAULT '',
+                    paper_balance REAL NOT NULL DEFAULT 10000
+                )"""
             )
             await db.execute(
                 """CREATE TABLE IF NOT EXISTS trades (
@@ -28,14 +49,63 @@ class StateStore:
             )
             await db.commit()
 
-    async def save_daily(self, day: str, realized: float, trades: int, halted: bool, reason: str) -> None:
+    async def load_risk_state(self, default_paper_balance: float = 10000.0) -> RiskState | None:
+        async with aiosqlite.connect(self.path) as db:
+            async with db.execute(
+                "SELECT trading_day, anchor_balance, peak_balance, realized_pnl_usd, "
+                "trades_today, halted, halt_reason, paper_balance FROM risk_state WHERE id = 1"
+            ) as cur:
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                return RiskState(
+                    trading_day=row[0],
+                    anchor_balance=float(row[1]),
+                    peak_balance=float(row[2]),
+                    realized_pnl_usd=float(row[3]),
+                    trades_today=int(row[4]),
+                    halted=bool(row[5]),
+                    halt_reason=row[6] or "",
+                    paper_balance=float(row[7]),
+                )
+
+    async def save_risk_state(
+        self,
+        trading_day: date,
+        anchor_balance: float,
+        peak_balance: float,
+        realized_pnl_usd: float,
+        trades_today: int,
+        halted: bool,
+        halt_reason: str,
+        paper_balance: float,
+    ) -> None:
+        day_str = trading_day.isoformat()
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                """INSERT INTO daily_pnl(day,realized_usd,trades,halted,halt_reason)
-                   VALUES(?,?,?,?,?) ON CONFLICT(day) DO UPDATE SET
-                   realized_usd=excluded.realized_usd, trades=excluded.trades,
-                   halted=excluded.halted, halt_reason=excluded.halt_reason""",
-                (day, realized, trades, int(halted), reason),
+                """INSERT INTO risk_state(
+                       id, trading_day, anchor_balance, peak_balance, realized_pnl_usd,
+                       trades_today, halted, halt_reason, paper_balance)
+                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       trading_day=excluded.trading_day,
+                       anchor_balance=excluded.anchor_balance,
+                       peak_balance=excluded.peak_balance,
+                       realized_pnl_usd=excluded.realized_pnl_usd,
+                       trades_today=excluded.trades_today,
+                       halted=excluded.halted,
+                       halt_reason=excluded.halt_reason,
+                       paper_balance=excluded.paper_balance""",
+                (
+                    day_str,
+                    anchor_balance,
+                    peak_balance,
+                    realized_pnl_usd,
+                    trades_today,
+                    int(halted),
+                    halt_reason,
+                    paper_balance,
+                ),
             )
             await db.commit()
 

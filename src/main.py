@@ -35,13 +35,14 @@ class DerivVolBot:
         self._tick_event = asyncio.Event()
         self._paper_ticks_left = 0
         self._paper_entry_price = 0.0
+        self._paper_start_balance = 10000.0
 
-        balance = 10000.0 if self.client.paper_mode else 0.0
         self.pnl = DailyPnLTracker(
             target_usd=self.settings.risk.daily_profit_target_usd,
             max_daily_loss_pct=self.settings.risk.max_daily_loss_pct,
             max_drawdown_pct=self.settings.risk.max_drawdown_pct,
-            session_start_balance=balance,
+            anchor_balance=10000.0,
+            peak_balance=10000.0,
         )
         self.sizer = StakeSizer(
             self.settings.risk.max_stake_usd,
@@ -54,8 +55,10 @@ class DerivVolBot:
         await self.store.init()
         await self.client.connect()
 
-        balance = self.client.balance if not self.client.paper_mode else 10000.0
-        self.pnl.session_start_balance = balance
+        await self._restore_risk_state()
+        balance = self._get_balance()
+        self.pnl.check_equity(balance)
+        await self._persist_risk_state()
 
         symbols = [leg.symbol for leg in self.settings.vol_pairs]
         for sym in symbols:
@@ -69,6 +72,10 @@ class DerivVolBot:
             symbols=symbols,
             paper=self.client.paper_mode,
             target_usd=self.settings.risk.daily_profit_target_usd,
+            daily_pnl=round(self.pnl.total_pnl_usd, 4),
+            halted=self.pnl.halted,
+            halt_reason=self.pnl.halt_reason or None,
+            anchor_balance=round(self.pnl.anchor_balance, 2),
         )
 
         reconcile = asyncio.create_task(self._reconcile_loop())
@@ -110,6 +117,7 @@ class DerivVolBot:
                     )
                     pnl = await self.contracts.settle_paper(won)
                     self.pnl.record(pnl, self._get_balance())
+                    await self._persist_risk_state()
                     self.strategy.set_in_contract(False)
                     await self.store.log_trade(oc.trade_id, oc.symbol, "win" if won else "loss", pnl, True)
             return
@@ -149,21 +157,70 @@ class DerivVolBot:
         pnl = self.contracts.on_contract_update(data)
         if pnl is not None:
             self.pnl.record(pnl, self._get_balance())
+            await self._persist_risk_state()
             self.strategy.set_in_contract(False)
             log.info("contract_settled", pnl=round(pnl, 4))
 
     def _get_balance(self) -> float:
         if self.client.paper_mode:
-            return 10000.0 + self.contracts._paper_balance_delta + self.pnl.total_pnl_usd
+            return self._paper_start_balance + self.contracts._paper_balance_delta
         return self.client.balance
+
+    async def _restore_risk_state(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        live_balance = self.client.balance if not self.client.paper_mode else 10000.0
+        saved = await self.store.load_risk_state()
+
+        if saved is None:
+            self._paper_start_balance = 10000.0
+            self.pnl.trading_day = today
+            self.pnl.anchor_balance = live_balance
+            self.pnl.peak_balance = live_balance
+            return
+
+        self._paper_start_balance = saved.paper_balance
+        saved_day = date.fromisoformat(saved.trading_day)
+
+        if saved_day == today:
+            # Same UTC day: restore counters and halt — restart cannot bypass limits
+            self.pnl.trading_day = today
+            self.pnl.anchor_balance = saved.anchor_balance
+            self.pnl.peak_balance = max(saved.peak_balance, live_balance)
+            self.pnl.realized_pnl_usd = saved.realized_pnl_usd
+            self.pnl.trades_today = saved.trades_today
+            self.pnl.halted = saved.halted
+            self.pnl.halt_reason = saved.halt_reason
+            log.info(
+                "risk_state_restored",
+                day=saved.trading_day,
+                realized_pnl=saved.realized_pnl_usd,
+                halted=saved.halted,
+            )
+        else:
+            # New UTC day: fresh daily budget, keep paper balance continuity
+            self.pnl.sync_day(live_balance, today)
+            if self.client.paper_mode:
+                self.pnl.anchor_balance = self._paper_start_balance
+                self.pnl.peak_balance = self._paper_start_balance
+
+    async def _persist_risk_state(self) -> None:
+        balance = self._get_balance()
+        await self.store.save_risk_state(
+            trading_day=self.pnl.trading_day,
+            anchor_balance=self.pnl.anchor_balance,
+            peak_balance=max(self.pnl.peak_balance, balance),
+            realized_pnl_usd=self.pnl.total_pnl_usd,
+            trades_today=self.pnl.trades_today,
+            halted=self.pnl.halted,
+            halt_reason=self.pnl.halt_reason,
+            paper_balance=self._get_balance() if self.client.paper_mode else self.client.balance,
+        )
 
     async def _reconcile_loop(self) -> None:
         while self._running:
             await asyncio.sleep(self.settings.bot.reconcile_interval_sec)
-            today = datetime.now(timezone.utc).date().isoformat()
-            await self.store.save_daily(
-                today, self.pnl.total_pnl_usd, self.pnl.trades_today, self.pnl.halted, self.pnl.halt_reason
-            )
+            self.pnl.check_equity(self._get_balance())
+            await self._persist_risk_state()
 
 
 async def main() -> None:
