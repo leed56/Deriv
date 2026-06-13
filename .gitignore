@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Bot runtime state
+/data/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
