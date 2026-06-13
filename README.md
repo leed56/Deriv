@@ -34,9 +34,23 @@ Each return is scaled by that index's theoretical vol (10%, 25%, etc.) so moves 
 | Leg selection | Most misaligned index in basket |
 | Execution | **CALL/PUT** over 5 ticks — stake = max loss |
 
-### Profit-first design
+### Profit insertion loop (24/7)
 
-The bot's **primary goal is +$5/day**. When hit, it **stops trading for the day** (`profit_day_complete`) — that is success, not failure.
+The bot runs a continuous cycle until **+$5/day** is banked:
+
+```
+SCAN signal → INSERT trade → SETTLE → ACCUMULATE → re-INSERT (compound wins)
+```
+
+| Step | What happens |
+|------|----------------|
+| **SCAN** | Wait for dual-spread consensus on V10/V25/V50/V75 |
+| **INSERT** | Open CALL/PUT; stake includes **50% of today's profit** |
+| **SETTLE** | Contract closes; P&L added to daily total |
+| **ACCUMULATE** | Wins compound into next stake (faster path to $5) |
+| **LOCK** | At +$5 → `profit_day_complete` → loop stops for the day |
+
+Configure in `config/settings.yaml` under `bot.profit_loop`.
 
 | Mechanism | Purpose |
 |-----------|---------|

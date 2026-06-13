@@ -55,11 +55,15 @@ class RiskConfig:
     currency: str = "USD"
 
 
+from src.loop.profit_loop import ProfitLoopConfig
+
+
 @dataclass
 class BotConfig:
     state_db: str = "data/bot_state.db"
     log_level: str = "INFO"
     reconcile_interval_sec: int = 30
+    profit_loop: ProfitLoopConfig = field(default_factory=ProfitLoopConfig)
 
 
 @dataclass
@@ -105,6 +109,20 @@ def load_settings() -> Settings:
 
     vol_pairs = [VolPairLeg(**leg) for leg in raw["vol_pairs"]]
 
+    bot_raw = raw.get("bot", {})
+    pl_raw = bot_raw.get("profit_loop", {})
+    bot = BotConfig(
+        state_db=bot_raw.get("state_db", "data/bot_state.db"),
+        log_level=bot_raw.get("log_level", "INFO"),
+        reconcile_interval_sec=bot_raw.get("reconcile_interval_sec", 30),
+        profit_loop=ProfitLoopConfig(
+            enabled=pl_raw.get("enabled", True),
+            reinvest_profit_pct=pl_raw.get("reinvest_profit_pct", 0.5),
+            min_seconds_between_trades=pl_raw.get("min_seconds_between_trades", 4),
+            compound_wins=pl_raw.get("compound_wins", True),
+        ),
+    )
+
     return Settings(
         ws_url=deriv["ws_url"],
         app_id=app_id,
@@ -113,5 +131,5 @@ def load_settings() -> Settings:
         vol_pairs=vol_pairs,
         strategy=strategy,
         risk=RiskConfig(**risk),
-        bot=BotConfig(**raw["bot"]),
+        bot=bot,
     )

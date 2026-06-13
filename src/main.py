@@ -10,15 +10,16 @@ from src.api.client import DerivClient
 from src.config import load_settings
 from src.execution.order_manager import ContractManager
 from src.logging_setup import setup_logging
+from src.loop.profit_loop import LoopPhase, ProfitLoop
 from src.risk.manager import DailyPnLTracker, StakeSizer
 from src.storage.state import StateStore
-from src.strategy.engine import TradeAction, VolPairEngine
+from src.strategy.engine import TradeAction, VolPairEngine, VolPairSignal
 
 log = structlog.get_logger()
 
 
 class DerivVolBot:
-    """Autonomous Deriv synthetic volatility pair bot (V10/V25/V50/V75)."""
+    """Autonomous Deriv vol pair bot with profit insertion loop."""
 
     def __init__(self) -> None:
         self.settings = load_settings()
@@ -31,7 +32,9 @@ class DerivVolBot:
         self.contracts = ContractManager(self.client, self.settings.strategy, self.settings.risk)
         self.store = StateStore(self.settings.bot.state_db)
         self._running = False
-        self._tick_event = asyncio.Event()
+        self._cycle_event = asyncio.Event()
+        self._last_signal: VolPairSignal | None = None
+        self._last_quote: dict[str, float] = {}
         self._paper_ticks_left = 0
         self._paper_entry_price = 0.0
         self._paper_start_balance = 10000.0
@@ -51,6 +54,12 @@ class DerivVolBot:
         )
         self.sizer = StakeSizer(r.max_stake_usd, r.min_stake_usd, r.stake_pct_of_balance)
 
+        self.profit_loop = ProfitLoop(
+            self.settings.bot.profit_loop,
+            target_usd=r.daily_profit_target_usd,
+        )
+        self._loop_enabled = self.settings.bot.profit_loop.enabled
+
     async def start(self) -> None:
         setup_logging(self.settings.bot.log_level)
         await self.store.init()
@@ -67,101 +76,170 @@ class DerivVolBot:
         await self.client.subscribe_ticks(symbols)
 
         self._running = True
+        if self.pnl.profit_day_locked:
+            self.profit_loop.set_phase(LoopPhase.LOCKED)
+
         status = "PROFIT_LOCKED" if self.pnl.profit_day_locked else (
-            "COOLDOWN" if self.pnl.in_cooldown else "TRADING"
+            "COOLDOWN" if self.pnl.in_cooldown else "LOOP_ACTIVE"
         )
         log.info(
             "bot_started",
             status=status,
+            profit_loop=self._loop_enabled,
             symbols=symbols,
             paper=self.client.paper_mode,
             target_usd=self.settings.risk.daily_profit_target_usd,
             daily_pnl=round(self.pnl.total_pnl_usd, 4),
-            stake_mult=round(self.pnl.stake_multiplier, 2),
         )
 
         reconcile = asyncio.create_task(self._reconcile_loop())
+        profit_loop_task = asyncio.create_task(self._profit_insertion_loop())
         try:
             while self._running:
-                try:
-                    await asyncio.wait_for(self._tick_event.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-                self._tick_event.clear()
+                await asyncio.sleep(1)
         finally:
             reconcile.cancel()
+            profit_loop_task.cancel()
             await self.client.close()
 
     async def stop(self) -> None:
         self._running = False
+        self._cycle_event.set()
         log.info("bot_stopped", daily_pnl=round(self.pnl.total_pnl_usd, 4))
+
+    async def _profit_insertion_loop(self) -> None:
+        """
+        Core insertion loop — runs continuously:
+
+          SCAN → INSERT → wait settle → ACCUMULATE → re-INSERT until +$target
+        """
+        while self._running:
+            try:
+                await asyncio.wait_for(self._cycle_event.wait(), timeout=2.0)
+            except asyncio.TimeoutError:
+                if self._loop_enabled and self.profit_loop.phase == LoopPhase.SCAN:
+                    self._cycle_event.set()
+                continue
+            self._cycle_event.clear()
+
+            if not self._loop_enabled or self.pnl.is_blocked:
+                if self.pnl.profit_day_locked:
+                    self.profit_loop.set_phase(LoopPhase.LOCKED)
+                continue
+
+            if not self.profit_loop.ready_to_insert(self.pnl.is_blocked, self.contracts.has_open):
+                continue
+
+            sig = self._last_signal
+            if not sig or sig.action == TradeAction.FLAT:
+                self.profit_loop.set_phase(LoopPhase.SCAN)
+                continue
+
+            quote = self._last_quote.get(sig.symbol)
+            if quote is None:
+                continue
+
+            base = self.sizer.stake(
+                self._get_balance(), sig.confidence, self.pnl.stake_multiplier
+            )
+            stake = self.profit_loop.next_stake(
+                base, self.settings.risk.max_stake_usd, self.pnl.total_pnl_usd
+            )
+
+            self.profit_loop.set_phase(LoopPhase.INSERT)
+            opened = await self.contracts.open_contract(sig, stake)
+            if not opened:
+                self.profit_loop.set_phase(LoopPhase.SCAN)
+                continue
+
+            self.profit_loop.on_trade_opened()
+            self.strategy.set_in_contract(True)
+            if opened.paper:
+                self._paper_ticks_left = self.settings.strategy.contract_duration
+                self._paper_entry_price = quote
+
+            snap = self.profit_loop.snapshot(self.pnl.total_pnl_usd)
+            log.info(
+                "loop_insert",
+                loop=snap["loop_count"] + 1,
+                phase="INSERT",
+                progress_pct=snap["progress_pct"],
+                stake=stake,
+                symbol=sig.symbol,
+                action=sig.action.value,
+            )
 
     async def _handle_tick(self, tick: dict) -> None:
         symbol = tick["symbol"]
         quote = float(tick["quote"])
         epoch = int(tick["epoch"])
-        self._tick_event.set()
+        self._last_quote[symbol] = quote
 
         sig = self.strategy.on_tick(symbol, quote, epoch)
-        if sig is None:
-            return
+        if sig is not None:
+            self._last_signal = sig
+            if self.profit_loop.phase in (LoopPhase.SCAN, LoopPhase.ACCUMULATE):
+                self._cycle_event.set()
 
         if self.contracts.has_open and self.contracts.open and self.contracts.open.paper:
             if symbol == self.contracts.open.symbol:
                 self._paper_ticks_left -= 1
                 if self._paper_ticks_left <= 0:
-                    oc = self.contracts.open
-                    won = (
-                        quote > self._paper_entry_price
-                        if oc.contract_type == "CALL"
-                        else quote < self._paper_entry_price
-                    )
-                    pnl = await self.contracts.settle_paper(won)
-                    self.strategy.record_result(pnl)
-                    self.pnl.record(pnl, self._get_balance())
-                    if self.pnl.profit_day_locked:
-                        log.info("profit_day_complete", pnl=round(self.pnl.total_pnl_usd, 2))
-                    await self._persist_risk_state()
-                    self.strategy.set_in_contract(False)
-                    await self.store.log_trade(oc.trade_id, oc.symbol, "win" if won else "loss", pnl, True)
+                    await self._settle_and_loop()
             return
 
-        if self.contracts.has_open or self.pnl.is_blocked or not sig or sig.action == TradeAction.FLAT:
+    async def _settle_and_loop(self) -> None:
+        oc = self.contracts.open
+        if not oc:
             return
-
-        if not self.pnl.can_trade(0, self.settings.risk.max_open_contracts):
-            return
-
-        stake = self.sizer.stake(
-            self._get_balance(), sig.confidence, self.pnl.stake_multiplier
+        quote = self._last_quote.get(oc.symbol, self._paper_entry_price)
+        won = (
+            quote > self._paper_entry_price
+            if oc.contract_type == "CALL"
+            else quote < self._paper_entry_price
         )
-        opened = await self.contracts.open_contract(sig, stake)
-        if opened:
-            self.strategy.set_in_contract(True)
-            if opened.paper:
-                self._paper_ticks_left = self.settings.strategy.contract_duration
-                self._paper_entry_price = quote
+        pnl = await self.contracts.settle_paper(won)
+        await self._after_settlement(pnl, oc.trade_id, oc.symbol, won)
+
+    async def _after_settlement(
+        self, pnl: float, trade_id: str, symbol: str, won: bool
+    ) -> None:
+        self.strategy.record_result(pnl)
+        self.pnl.record(pnl, self._get_balance())
+        self.profit_loop.on_trade_settled(
+            pnl, self.pnl.total_pnl_usd, self.pnl.profit_day_locked
+        )
+        snap = self.profit_loop.snapshot(self.pnl.total_pnl_usd)
+        log.info(
+            "loop_accumulate",
+            result="win" if won else "loss",
+            pnl=round(pnl, 4),
+            daily_pnl=round(self.pnl.total_pnl_usd, 4),
+            progress_pct=snap["progress_pct"],
+            loops=snap["loop_count"],
+        )
+        if self.pnl.profit_day_locked:
             log.info(
-                "signal_trade",
-                symbol=sig.symbol,
-                action=sig.action.value,
-                zscore=round(sig.zscore, 3),
-                confidence=round(sig.confidence, 3),
-                stake=stake,
-                reason=sig.reason,
+                "profit_day_complete",
+                pnl=round(self.pnl.total_pnl_usd, 2),
+                loops=snap["loop_count"],
             )
-        await self.store.log_snapshot(sig.zscore, sig.spread, self.pnl.total_pnl_usd, sig.reason)
+        await self._persist_risk_state()
+        self.strategy.set_in_contract(False)
+        await self.store.log_trade(trade_id, symbol, "win" if won else "loss", pnl, True)
+
+        if not self.pnl.is_blocked:
+            self.profit_loop.set_phase(LoopPhase.SCAN)
+            self._cycle_event.set()
 
     async def _handle_contract_update(self, data: dict) -> None:
+        if not self.contracts.open:
+            return
+        oc = self.contracts.open
+        trade_id, symbol = oc.trade_id, oc.symbol
         pnl = self.contracts.on_contract_update(data)
         if pnl is not None:
-            self.strategy.record_result(pnl)
-            self.pnl.record(pnl, self._get_balance())
-            if self.pnl.profit_day_locked:
-                log.info("profit_day_complete", pnl=round(self.pnl.total_pnl_usd, 2))
-            await self._persist_risk_state()
-            self.strategy.set_in_contract(False)
-            log.info("contract_settled", pnl=round(pnl, 4))
+            await self._after_settlement(pnl, trade_id, symbol, pnl >= 0)
 
     def _get_balance(self) -> float:
         if self.client.paper_mode:
