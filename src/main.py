@@ -7,68 +7,71 @@ from datetime import datetime, timezone
 
 import structlog
 
-from src.api.client import DeribitClient
+from src.api.client import DerivClient
 from src.config import load_settings
-from src.execution.order_manager import OrderManager, PositionState
+from src.execution.order_manager import ContractManager
 from src.logging_setup import setup_logging
-from src.risk.manager import build_risk
+from src.risk.manager import DailyPnLTracker, StakeSizer
 from src.storage.state import StateStore
-from src.strategy.engine import MarketTick, SignalSide, SyntheticSpreadEngine
-from src.strategy.microstructure import MicrostructureState, OrderBookSnapshot
+from src.strategy.engine import TradeAction, VolPairEngine
 
 log = structlog.get_logger()
 
 
-class ProfitBot:
-    """Fully autonomous Deribit demo trading bot targeting daily USD profit."""
+class DerivVolBot:
+    """Autonomous Deriv synthetic volatility pair bot (V10/V25/V50/V75)."""
 
     def __init__(self) -> None:
         self.settings = load_settings()
-        self.client = DeribitClient(
-            self.settings.http_url,
+        self.client = DerivClient(
             self.settings.ws_url,
-            self.settings.client_id,
-            self.settings.client_secret,
+            self.settings.app_id,
+            self.settings.api_token,
         )
-        self.strategy = SyntheticSpreadEngine(self.settings.strategy)
-        self.pnl_tracker, self.sizer = build_risk(self.settings.risk)
-        self.orders = OrderManager(
-            self.client, self.settings.execution, self.settings.leg_a, self.settings.leg_b
-        )
+        self.strategy = VolPairEngine(self.settings.strategy, self.settings.vol_pairs)
+        self.contracts = ContractManager(self.client, self.settings.strategy, self.settings.risk)
         self.store = StateStore(self.settings.bot.state_db)
         self._running = False
-        self._latest: dict = {
-            "btc_price": 0.0,
-            "eth_price": 0.0,
-            "btc_funding": 0.0,
-            "eth_funding": 0.0,
-            "micro": MicrostructureState(),
-        }
         self._tick_event = asyncio.Event()
-        self._account_equity_usd = 10000.0
+        self._paper_ticks_left = 0
+        self._paper_entry_price = 0.0
+
+        balance = 10000.0 if self.client.paper_mode else 0.0
+        self.pnl = DailyPnLTracker(
+            target_usd=self.settings.risk.daily_profit_target_usd,
+            max_daily_loss_pct=self.settings.risk.max_daily_loss_pct,
+            max_drawdown_pct=self.settings.risk.max_drawdown_pct,
+            session_start_balance=balance,
+        )
+        self.sizer = StakeSizer(
+            self.settings.risk.max_stake_usd,
+            self.settings.risk.min_stake_usd,
+            self.settings.risk.stake_pct_of_balance,
+        )
 
     async def start(self) -> None:
         setup_logging(self.settings.bot.log_level)
         await self.store.init()
-
-        today = datetime.now(timezone.utc).date().isoformat()
-        restored = await self.store.load_today_pnl(today)
-        self.pnl_tracker.realized_pnl_usd = restored
-
         await self.client.connect()
-        await self._bootstrap_market_data()
-        await self._subscribe()
+
+        balance = self.client.balance if not self.client.paper_mode else 10000.0
+        self.pnl.session_start_balance = balance
+
+        symbols = [leg.symbol for leg in self.settings.vol_pairs]
+        for sym in symbols:
+            self.client.on_tick(sym, self._handle_tick)
+        self.client.on_contract(self._handle_contract_update)
+        await self.client.subscribe_ticks(symbols)
 
         self._running = True
         log.info(
             "bot_started",
-            env=self.settings.env,
-            target_usd=self.settings.risk.daily_profit_target_usd,
+            symbols=symbols,
             paper=self.client.paper_mode,
-            legs=[self.settings.leg_a, self.settings.leg_b],
+            target_usd=self.settings.risk.daily_profit_target_usd,
         )
 
-        reconcile_task = asyncio.create_task(self._reconcile_loop())
+        reconcile = asyncio.create_task(self._reconcile_loop())
         try:
             while self._running:
                 try:
@@ -76,187 +79,99 @@ class ProfitBot:
                 except asyncio.TimeoutError:
                     pass
                 self._tick_event.clear()
-                await self._cycle()
         finally:
-            reconcile_task.cancel()
+            reconcile.cancel()
             await self.client.close()
 
     async def stop(self) -> None:
         self._running = False
-        if self.orders.is_open and self._latest["btc_price"]:
-            pnl = await self.orders.close_spread(
-                self._latest["btc_price"], self._latest["eth_price"]
+        log.info("bot_stopped", daily_pnl=round(self.pnl.total_pnl_usd, 4))
+
+    async def _handle_tick(self, tick: dict) -> None:
+        symbol = tick["symbol"]
+        quote = float(tick["quote"])
+        epoch = int(tick["epoch"])
+        self._tick_event.set()
+
+        sig = self.strategy.on_tick(symbol, quote, epoch)
+        if sig is None:
+            return
+
+        # Paper contract expiry countdown
+        if self.contracts.has_open and self.contracts.open and self.contracts.open.paper:
+            if symbol == self.contracts.open.symbol:
+                self._paper_ticks_left -= 1
+                if self._paper_ticks_left <= 0:
+                    oc = self.contracts.open
+                    won = (
+                        quote > self._paper_entry_price
+                        if oc.contract_type == "CALL"
+                        else quote < self._paper_entry_price
+                    )
+                    pnl = await self.contracts.settle_paper(won)
+                    self.pnl.record(pnl, self._get_balance())
+                    self.strategy.set_in_contract(False)
+                    await self.store.log_trade(oc.trade_id, oc.symbol, "win" if won else "loss", pnl, True)
+            return
+
+        if self.contracts.has_open:
+            return
+
+        if self.pnl.halted:
+            return
+
+        if not sig or sig.action == TradeAction.FLAT:
+            return
+
+        if not self.pnl.can_trade(0, self.settings.risk.max_open_contracts):
+            return
+
+        stake = self.sizer.stake(self._get_balance(), sig.confidence)
+        opened = await self.contracts.open_contract(sig, stake)
+        if opened:
+            self.strategy.set_in_contract(True)
+            if opened.paper:
+                self._paper_ticks_left = self.settings.strategy.contract_duration
+                self._paper_entry_price = quote
+            log.info(
+                "signal_trade",
+                symbol=sig.symbol,
+                action=sig.action.value,
+                zscore=round(sig.zscore, 3),
+                confidence=round(sig.confidence, 3),
+                stake=stake,
+                reason=sig.reason,
             )
-            self.pnl_tracker.record_trade_pnl(pnl)
-        log.info("bot_stopped", daily_pnl=round(self.pnl_tracker.total_pnl_usd, 4))
 
-    async def _bootstrap_market_data(self) -> None:
-        for leg, key in ((self.settings.leg_a, "btc"), (self.settings.leg_b, "eth")):
-            ticker = await self.client.get_ticker(leg)
-            book = await self.client.get_order_book(leg)
-            price = ticker.get("last_price") or ticker.get("mark_price", 0)
-            self._latest[f"{key}_price"] = price
-            self._latest[f"{key}_funding"] = ticker.get("current_funding", 0) or 0
-            snap = OrderBookSnapshot.from_deribit(book)
-            micro: MicrostructureState = self._latest["micro"]
-            from src.strategy.microstructure import order_book_imbalance, spread_bps
+        await self.store.log_snapshot(sig.zscore, sig.spread, self.pnl.total_pnl_usd, sig.reason)
 
-            obi = order_book_imbalance(snap)
-            sp = spread_bps(snap)
-            if key == "btc":
-                micro.obi_a, micro.spread_a_bps = obi, sp
-            else:
-                micro.obi_b, micro.spread_b_bps = obi, sp
+    async def _handle_contract_update(self, data: dict) -> None:
+        pnl = self.contracts.on_contract_update(data)
+        if pnl is not None:
+            self.pnl.record(pnl, self._get_balance())
+            self.strategy.set_in_contract(False)
+            log.info("contract_settled", pnl=round(pnl, 4))
 
-        if not self.client.paper_mode:
-            try:
-                summary = await self.client.get_account_summary(self.settings.currency)
-                self._account_equity_usd = summary.get("equity", 10000) * (
-                    self._latest["btc_price"] or 60000
-                )
-            except Exception:
-                pass
-
-    async def _subscribe(self) -> None:
-        channels = [
-            f"ticker.{self.settings.leg_a}.100ms",
-            f"ticker.{self.settings.leg_b}.100ms",
-            f"book.{self.settings.leg_a}.100ms",
-            f"book.{self.settings.leg_b}.100ms",
-        ]
-
-        async def on_ticker_a(data: dict) -> None:
-            self._latest["btc_price"] = data.get("last_price") or data.get("mark_price", 0)
-            self._latest["btc_funding"] = data.get("current_funding", 0) or 0
-            self._tick_event.set()
-
-        async def on_ticker_b(data: dict) -> None:
-            self._latest["eth_price"] = data.get("last_price") or data.get("mark_price", 0)
-            self._latest["eth_funding"] = data.get("current_funding", 0) or 0
-            self._tick_event.set()
-
-        from src.strategy.microstructure import order_book_imbalance, spread_bps
-
-        async def on_book_a(data: dict) -> None:
-            snap = OrderBookSnapshot.from_deribit(data)
-            micro: MicrostructureState = self._latest["micro"]
-            micro.obi_a = order_book_imbalance(snap)
-            micro.spread_a_bps = spread_bps(snap)
-
-        async def on_book_b(data: dict) -> None:
-            snap = OrderBookSnapshot.from_deribit(data)
-            micro: MicrostructureState = self._latest["micro"]
-            micro.obi_b = order_book_imbalance(snap)
-            micro.spread_b_bps = spread_bps(snap)
-
-        self.client.on_channel(f"ticker.{self.settings.leg_a}.100ms", on_ticker_a)
-        self.client.on_channel(f"ticker.{self.settings.leg_b}.100ms", on_ticker_b)
-        self.client.on_channel(f"book.{self.settings.leg_a}.100ms", on_book_a)
-        self.client.on_channel(f"book.{self.settings.leg_b}.100ms", on_book_b)
-        await self.client.subscribe(channels)
+    def _get_balance(self) -> float:
+        if self.client.paper_mode:
+            return 10000.0 + self.contracts._paper_balance_delta + self.pnl.total_pnl_usd
+        return self.client.balance
 
     async def _reconcile_loop(self) -> None:
         while self._running:
-            await asyncio.sleep(self.settings.execution.reconcile_interval_sec)
+            await asyncio.sleep(self.settings.bot.reconcile_interval_sec)
             today = datetime.now(timezone.utc).date().isoformat()
             await self.store.save_daily(
-                today,
-                self.pnl_tracker.realized_pnl_usd,
-                self.pnl_tracker.trades_today,
-                self.pnl_tracker.halted,
-                self.pnl_tracker.halt_reason,
+                today, self.pnl.total_pnl_usd, self.pnl.trades_today, self.pnl.halted, self.pnl.halt_reason
             )
-
-    async def _cycle(self) -> None:
-        btc = self._latest["btc_price"]
-        eth = self._latest["eth_price"]
-        if btc <= 0 or eth <= 0:
-            return
-
-        tick = MarketTick(
-            btc_price=btc,
-            eth_price=eth,
-            btc_funding=self._latest["btc_funding"],
-            eth_funding=self._latest["eth_funding"],
-            micro=self._latest["micro"],
-            timestamp=time.time(),
-        )
-
-        signal = self.strategy.evaluate(tick)
-        unrealized = self.orders.unrealized_pnl(btc, eth)
-        self.pnl_tracker.update_unrealized(unrealized)
-
-        await self.store.log_snapshot(
-            signal.zscore, signal.beta, signal.spread, self.pnl_tracker.total_pnl_usd, signal.reason
-        )
-
-        if self.pnl_tracker.halted:
-            if self.orders.is_open and signal.side == SignalSide.FLAT:
-                pnl = await self.orders.close_spread(btc, eth)
-                self.pnl_tracker.record_trade_pnl(pnl)
-                self.strategy.set_position(SignalSide.FLAT)
-            return
-
-        # Close on exit signal
-        if self.orders.is_open and signal.side == SignalSide.FLAT:
-            pos = self.orders.position
-            pnl = await self.orders.close_spread(btc, eth)
-            self.pnl_tracker.record_trade_pnl(pnl)
-            if pos:
-                await self.store.log_trade(
-                    pos.trade_id,
-                    pos.state.value,
-                    pos.btc_amount,
-                    pos.eth_amount,
-                    pos.entry_zscore,
-                    pnl,
-                    pos.paper,
-                    pos.opened_at,
-                )
-            self.strategy.set_position(SignalSide.FLAT)
-            log.info(
-                "trade_closed",
-                pnl=round(pnl, 4),
-                daily_pnl=round(self.pnl_tracker.total_pnl_usd, 4),
-                reason=signal.reason,
-            )
-            return
-
-        # Open new spread trade
-        if (
-            not self.orders.is_open
-            and signal.side != SignalSide.FLAT
-            and self.pnl_tracker.can_open_trade(self.settings.risk.max_open_trades, 0)
-        ):
-            notional = self.sizer.size_usd(signal.confidence, self._account_equity_usd)
-            btc_amt = self.sizer.btc_contracts(notional, btc)
-            eth_amt = self.sizer.eth_contracts(notional, eth, btc, signal.beta)
-            pos = await self.orders.open_spread(
-                signal.side, btc_amt, eth_amt, btc, eth, signal.zscore
-            )
-            if pos:
-                self.strategy.set_position(signal.side, signal.zscore)
-                log.info(
-                    "trade_opened",
-                    side=signal.side.value,
-                    confidence=round(signal.confidence, 3),
-                    zscore=round(signal.zscore, 3),
-                    beta=round(signal.beta, 4),
-                    reason=signal.reason,
-                )
 
 
 async def main() -> None:
-    bot = ProfitBot()
+    bot = DerivVolBot()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
-
-    def _shutdown() -> None:
-        stop_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _shutdown)
-
+    loop.add_signal_handler(signal.SIGINT, stop_event.set)
+    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
     run_task = asyncio.create_task(bot.start())
     await stop_event.wait()
     await bot.stop()

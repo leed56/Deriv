@@ -12,61 +12,60 @@ CONFIG_PATH = ROOT / "config" / "settings.yaml"
 
 
 @dataclass
+class VolPairLeg:
+    symbol: str
+    vol_pct: float
+    weight: float = 1.0
+
+
+@dataclass
 class KalmanConfig:
-    process_noise: float = 1e-5
-    observation_noise: float = 1e-3
-    beta_init: float = 1.35
+    process_noise: float = 1e-4
+    observation_noise: float = 1e-2
 
 
 @dataclass
 class StrategyConfig:
-    kalman: KalmanConfig = field(default_factory=KalmanConfig)
-    entry_zscore: float = 2.0
-    exit_zscore: float = 0.4
-    obi_weight: float = 0.35
-    funding_weight: float = 0.15
-    min_confidence: float = 0.55
-    warmup_ticks: int = 120
+    spread_pair_low: str
+    spread_pair_high: str
+    kalman: KalmanConfig
+    entry_zscore: float = 1.8
+    exit_zscore: float = 0.35
+    min_confidence: float = 0.52
+    warmup_ticks: int = 60
+    contract_duration: int = 5
+    contract_duration_unit: str = "t"
 
 
 @dataclass
 class RiskConfig:
     daily_profit_target_usd: float = 5.0
-    daily_loss_limit_usd: float = 15.0
-    max_position_usd: float = 500.0
-    max_open_trades: int = 2
-    stop_loss_pct: float = 0.8
-
-
-@dataclass
-class ExecutionConfig:
-    order_type: str = "limit"
-    post_only: bool = True
-    tick_offset: int = 1
-    reconcile_interval_sec: int = 30
+    max_daily_loss_pct: float = 0.05
+    max_drawdown_pct: float = 0.10
+    max_stake_usd: float = 2.0
+    min_stake_usd: float = 0.35
+    stake_pct_of_balance: float = 0.02
+    max_open_contracts: int = 1
+    currency: str = "USD"
 
 
 @dataclass
 class BotConfig:
-    heartbeat_sec: int = 10
     state_db: str = "data/bot_state.db"
     log_level: str = "INFO"
+    reconcile_interval_sec: int = 30
 
 
 @dataclass
 class Settings:
-    http_url: str
     ws_url: str
-    leg_a: str
-    leg_b: str
-    currency: str
-    client_id: str
-    client_secret: str
+    app_id: int
+    api_token: str
+    account_type: str
+    vol_pairs: list[VolPairLeg]
     strategy: StrategyConfig
     risk: RiskConfig
-    execution: ExecutionConfig
     bot: BotConfig
-    env: str
 
 
 def load_settings() -> Settings:
@@ -74,9 +73,8 @@ def load_settings() -> Settings:
     with CONFIG_PATH.open() as f:
         raw = yaml.safe_load(f)
 
-    env = os.getenv("DERIBIT_ENV", "testnet").lower()
-    endpoints = raw["deribit"][env]
-    inst = raw["instruments"]
+    deriv = raw["deriv"]
+    app_id = int(os.getenv("DERIV_APP_ID", deriv.get("app_id", 1089)))
 
     risk = raw.get("risk", {})
     if os.getenv("DAILY_PROFIT_TARGET_USD"):
@@ -84,26 +82,26 @@ def load_settings() -> Settings:
 
     kalman_raw = raw["strategy"]["kalman"]
     strategy = StrategyConfig(
+        spread_pair_low=raw["strategy"]["spread_pair_low"],
+        spread_pair_high=raw["strategy"]["spread_pair_high"],
         kalman=KalmanConfig(**kalman_raw),
         entry_zscore=raw["strategy"]["entry_zscore"],
         exit_zscore=raw["strategy"]["exit_zscore"],
-        obi_weight=raw["strategy"]["obi_weight"],
-        funding_weight=raw["strategy"]["funding_weight"],
         min_confidence=raw["strategy"]["min_confidence"],
         warmup_ticks=raw["strategy"]["warmup_ticks"],
+        contract_duration=raw["strategy"]["contract_duration"],
+        contract_duration_unit=raw["strategy"]["contract_duration_unit"],
     )
 
+    vol_pairs = [VolPairLeg(**leg) for leg in raw["vol_pairs"]]
+
     return Settings(
-        http_url=endpoints["http"],
-        ws_url=endpoints["ws"],
-        leg_a=inst["leg_a"],
-        leg_b=inst["leg_b"],
-        currency=inst["currency"],
-        client_id=os.getenv("DERIBIT_CLIENT_ID", ""),
-        client_secret=os.getenv("DERIBIT_CLIENT_SECRET", ""),
+        ws_url=deriv["ws_url"],
+        app_id=app_id,
+        api_token=os.getenv("DERIV_API_TOKEN", ""),
+        account_type=os.getenv("DERIV_ACCOUNT", "demo").lower(),
+        vol_pairs=vol_pairs,
         strategy=strategy,
         risk=RiskConfig(**risk),
-        execution=ExecutionConfig(**raw["execution"]),
         bot=BotConfig(**raw["bot"]),
-        env=env,
     )

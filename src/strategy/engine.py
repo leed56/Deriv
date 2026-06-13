@@ -4,169 +4,94 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 
-from src.config import StrategyConfig
+from src.config import StrategyConfig, VolPairLeg
 from src.strategy.kalman import KalmanSpreadFilter
-from src.strategy.microstructure import MicrostructureState
+from src.strategy.vol_normalize import VolPairBook
 
 
-class SignalSide(Enum):
+class TradeAction(Enum):
     FLAT = "flat"
-    LONG_SPREAD = "long_spread"   # long BTC, short ETH (spread too low)
-    SHORT_SPREAD = "short_spread"  # short BTC, long ETH (spread too high)
+    CALL = "call"
+    PUT = "put"
 
 
 @dataclass
-class MarketTick:
-    btc_price: float
-    eth_price: float
-    btc_funding: float = 0.0
-    eth_funding: float = 0.0
-    micro: MicrostructureState = field(default_factory=MicrostructureState)
-    timestamp: float = 0.0
-
-
-@dataclass
-class StrategySignal:
-    side: SignalSide
+class VolPairSignal:
+    action: TradeAction
+    symbol: str
     confidence: float
     zscore: float
-    beta: float
     spread: float
     fair_spread: float
     reason: str
 
 
-class SyntheticSpreadEngine:
+class VolPairEngine:
     """
-    Autonomous strategy combining:
-    - Kalman-filtered synthetic BTC/ETH log-spread
-    - Order-book microstructure (no RSI/MACD/MA)
-    - Funding rate differential for carry bias
-    """
+    Synthetic volatility pair strategy across Deriv V10/V25/V50/V75.
 
-    def __init__(self, config: StrategyConfig) -> None:
+    Builds spread = normalized_momentum(R_75) - normalized_momentum(R_10)
+    scaled by each index's fixed vol parameter (10%, 25%, 50%, 75%).
+
+    Uses Kalman innovation z-scores — not RSI/MACD/MA.
+  """
+
+    def __init__(self, config: StrategyConfig, legs: list[VolPairLeg]) -> None:
         self.config = config
+        self.legs = legs
+        self.book = VolPairBook()
+        for leg in legs:
+            self.book.ensure(leg.symbol, leg.vol_pct)
         self.kalman = KalmanSpreadFilter(
             process_noise=config.kalman.process_noise,
             observation_noise=config.kalman.observation_noise,
-            beta_init=config.kalman.beta_init,
+            beta_init=1.0,
         )
-        self._position_side = SignalSide.FLAT
-        self._entry_zscore = 0.0
+        self._tick_count = 0
+        self._in_contract = False
 
-    @property
-    def position_side(self) -> SignalSide:
-        return self._position_side
+    def set_in_contract(self, active: bool) -> None:
+        self._in_contract = active
 
-    def set_position(self, side: SignalSide, entry_zscore: float = 0.0) -> None:
-        self._position_side = side
-        self._entry_zscore = entry_zscore
+    def on_tick(self, symbol: str, quote: float, epoch: int) -> VolPairSignal | None:
+        leg = next((l for l in self.legs if l.symbol == symbol), None)
+        if not leg:
+            return None
+        state = self.book.ensure(leg.symbol, leg.vol_pct)
+        norm = state.update(quote, epoch)
+        if norm is None:
+            return None
+        self._tick_count += 1
+        return self.evaluate()
 
-    def evaluate(self, tick: MarketTick) -> StrategySignal:
-        log_btc = math.log(max(tick.btc_price, 1e-8))
-        log_eth = math.log(max(tick.eth_price, 1e-8))
-        spread, innovation, zscore = self.kalman.update(log_btc, log_eth)
+    def evaluate(self) -> VolPairSignal:
+        low = self.config.spread_pair_low
+        high = self.config.spread_pair_high
+        spread = self.book.momentum_spread(low, high)
+        _, _, zscore = self.kalman.update(spread, 0.0)  # univariate spread filter
 
-        if self.kalman.tick_count < self.config.warmup_ticks:
-            return StrategySignal(
-                side=SignalSide.FLAT,
-                confidence=0.0,
-                zscore=zscore,
-                beta=self.kalman.beta,
-                spread=spread,
-                fair_spread=self.kalman.fair_spread,
-                reason="warmup",
-            )
+        if self._tick_count < self.config.warmup_ticks or not self.book.ready():
+            return VolPairSignal(TradeAction.FLAT, "", 0.0, zscore, spread, self.kalman.fair_spread, "warmup")
 
-        # Funding differential: positive = BTC more expensive to hold long
-        funding_edge = tick.btc_funding - tick.eth_funding
-        funding_signal = -math.tanh(funding_edge * 500)  # mean-revert carry
+        if self._in_contract:
+            if abs(zscore) < self.config.exit_zscore:
+                return VolPairSignal(TradeAction.FLAT, "", 0.9, zscore, spread, self.kalman.fair_spread, "revert_exit")
+            return VolPairSignal(TradeAction.FLAT, "", 0.0, zscore, spread, self.kalman.fair_spread, "hold_contract")
 
-        micro_pressure = tick.micro.composite_pressure()
-        micro_signal = math.tanh(micro_pressure * 2)
-
-        # Exit logic for open positions
-        if self._position_side != SignalSide.FLAT:
-            revert = abs(zscore) < self.config.exit_zscore
-            flip = (
-                self._position_side == SignalSide.LONG_SPREAD and zscore > self.config.entry_zscore
-            ) or (
-                self._position_side == SignalSide.SHORT_SPREAD and zscore < -self.config.entry_zscore
-            )
-            if revert:
-                return StrategySignal(
-                    side=SignalSide.FLAT,
-                    confidence=0.9,
-                    zscore=zscore,
-                    beta=self.kalman.beta,
-                    spread=spread,
-                    fair_spread=self.kalman.fair_spread,
-                    reason="mean_reversion_exit",
-                )
-            if flip:
-                return StrategySignal(
-                    side=SignalSide.FLAT,
-                    confidence=0.85,
-                    zscore=zscore,
-                    beta=self.kalman.beta,
-                    spread=spread,
-                    fair_spread=self.kalman.fair_spread,
-                    reason="stop_flip",
-                )
-            return StrategySignal(
-                side=self._position_side,
-                confidence=0.5,
-                zscore=zscore,
-                beta=self.kalman.beta,
-                spread=spread,
-                fair_spread=self.kalman.fair_spread,
-                reason="hold",
-            )
-
-        if not tick.micro.liquidity_ok():
-            return StrategySignal(
-                side=SignalSide.FLAT,
-                confidence=0.0,
-                zscore=zscore,
-                beta=self.kalman.beta,
-                spread=spread,
-                fair_spread=self.kalman.fair_spread,
-                reason="illiquid",
-            )
-
-        # Entry: z-score driven with microstructure + funding confirmation
-        stat_signal = -zscore  # mean revert: short spread when z high
-        combined = (
-            stat_signal * (1 - self.config.obi_weight - self.config.funding_weight)
-            + micro_signal * self.config.obi_weight
-            + funding_signal * self.config.funding_weight
-        )
-        confidence = min(1.0, abs(combined) / self.config.entry_zscore)
-
+        confidence = min(1.0, abs(zscore) / self.config.entry_zscore)
         if abs(zscore) < self.config.entry_zscore or confidence < self.config.min_confidence:
-            return StrategySignal(
-                side=SignalSide.FLAT,
-                confidence=confidence,
-                zscore=zscore,
-                beta=self.kalman.beta,
-                spread=spread,
-                fair_spread=self.kalman.fair_spread,
-                reason="no_edge",
-            )
+            return VolPairSignal(TradeAction.FLAT, "", confidence, zscore, spread, self.kalman.fair_spread, "no_edge")
 
-        if combined > 0:
-            side = SignalSide.LONG_SPREAD
-            reason = "spread_below_fair"
+        # Pick the most misaligned leg to trade (max drawdown control: one contract)
+        pressure = self.book.basket_pressure()
+        if zscore > 0:
+            # Spread too high: high-vol index overshooting → PUT it, or CALL low-vol
+            sym = high if pressure.get(high, 0) > abs(pressure.get(low, 0)) else low
+            action = TradeAction.PUT if sym == high else TradeAction.CALL
+            reason = "high_vol_overextended"
         else:
-            side = SignalSide.SHORT_SPREAD
-            reason = "spread_above_fair"
+            sym = low if pressure.get(low, 0) < -abs(pressure.get(high, 0)) else high
+            action = TradeAction.PUT if sym == high else TradeAction.CALL
+            reason = "low_vol_underextended"
 
-        return StrategySignal(
-            side=side,
-            confidence=confidence,
-            zscore=zscore,
-            beta=self.kalman.beta,
-            spread=spread,
-            fair_spread=self.kalman.fair_spread,
-            reason=reason,
-        )
+        return VolPairSignal(action, sym, confidence, zscore, spread, self.kalman.fair_spread, reason)

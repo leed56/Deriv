@@ -3,176 +3,109 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from enum import Enum
 
 import structlog
 
-from src.api.client import DeribitClient
-from src.config import ExecutionConfig
-from src.strategy.engine import SignalSide
+from src.api.client import DerivClient
+from src.config import RiskConfig, StrategyConfig
+from src.strategy.engine import TradeAction, VolPairSignal
 
 log = structlog.get_logger()
 
 
-class PositionState(Enum):
-    FLAT = "flat"
-    LONG_SPREAD = "long_spread"
-    SHORT_SPREAD = "short_spread"
-
-
 @dataclass
-class OpenPosition:
-    state: PositionState
-    btc_amount: float
-    eth_amount: float
-    entry_btc: float
-    entry_eth: float
-    entry_zscore: float
-    opened_at: float = field(default_factory=time.time)
+class OpenContract:
+    contract_id: str
+    symbol: str
+    contract_type: str
+    stake: float
+    entry_epoch: int
     paper: bool = False
     trade_id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
 
-@dataclass
-class PaperLedger:
-    """Simulated fills when running without API keys."""
+class ContractManager:
+    """Execute Deriv CALL/PUT with fixed stake (= max loss per trade)."""
 
-    balance_usd: float = 10000.0
-    positions: list[OpenPosition] = field(default_factory=list)
-
-    def open(self, pos: OpenPosition) -> None:
-        self.positions.append(pos)
-
-    def close(self, pos: OpenPosition, pnl: float) -> None:
-        if pos in self.positions:
-            self.positions.remove(pos)
-        self.balance_usd += pnl
-
-
-class OrderManager:
-    def __init__(
-        self,
-        client: DeribitClient,
-        execution: ExecutionConfig,
-        leg_a: str,
-        leg_b: str,
-    ) -> None:
+    def __init__(self, client: DerivClient, strategy: StrategyConfig, risk: RiskConfig) -> None:
         self.client = client
-        self.execution = execution
-        self.leg_a = leg_a
-        self.leg_b = leg_b
-        self.position: OpenPosition | None = None
-        self.paper = PaperLedger()
+        self.strategy = strategy
+        self.risk = risk
+        self.open: OpenContract | None = None
+        self._paper_balance_delta = 0.0
 
     @property
-    def is_open(self) -> bool:
-        return self.position is not None
+    def has_open(self) -> bool:
+        return self.open is not None
 
-    def unrealized_pnl(self, btc_price: float, eth_price: float) -> float:
-        if not self.position:
-            return 0.0
-        p = self.position
-        btc_pnl = 0.0
-        eth_pnl = 0.0
-        if p.state == PositionState.LONG_SPREAD:
-            btc_pnl = (btc_price - p.entry_btc) / p.entry_btc * p.btc_amount
-            eth_pnl = (p.entry_eth - eth_price) / p.entry_eth * p.eth_amount
-        elif p.state == PositionState.SHORT_SPREAD:
-            btc_pnl = (p.entry_btc - btc_price) / p.entry_btc * p.btc_amount
-            eth_pnl = (eth_price - p.entry_eth) / p.entry_eth * p.eth_amount
-        return btc_pnl + eth_pnl
-
-    async def _limit_price(self, instrument: str, buy: bool) -> float:
-        book = await self.client.get_order_book(instrument, depth=1)
-        tick_size = 0.5 if "BTC" in instrument else 0.05
-        if buy:
-            price = book["bids"][0][0] + self.execution.tick_offset * tick_size
-        else:
-            price = book["asks"][0][0] - self.execution.tick_offset * tick_size
-        return round(price, 1 if "BTC" in instrument else 2)
-
-    async def open_spread(
-        self,
-        side: SignalSide,
-        btc_amount: float,
-        eth_amount: float,
-        btc_price: float,
-        eth_price: float,
-        zscore: float,
-    ) -> OpenPosition | None:
-        if side == SignalSide.FLAT or self.is_open:
+    async def open_contract(self, signal: VolPairSignal, stake: float) -> OpenContract | None:
+        if signal.action == TradeAction.FLAT or self.has_open:
             return None
 
-        state = (
-            PositionState.LONG_SPREAD
-            if side == SignalSide.LONG_SPREAD
-            else PositionState.SHORT_SPREAD
-        )
+        contract_type = "CALL" if signal.action == TradeAction.CALL else "PUT"
+        duration = self.strategy.contract_duration
+        unit = self.strategy.contract_duration_unit
 
         if self.client.paper_mode:
-            pos = OpenPosition(
-                state=state,
-                btc_amount=btc_amount,
-                eth_amount=eth_amount,
-                entry_btc=btc_price,
-                entry_eth=eth_price,
-                entry_zscore=zscore,
+            c = OpenContract(
+                contract_id=f"paper-{int(time.time())}",
+                symbol=signal.symbol,
+                contract_type=contract_type,
+                stake=stake,
+                entry_epoch=int(time.time()),
                 paper=True,
             )
-            self.position = pos
-            self.paper.open(pos)
-            log.info("paper_open", state=state.value, btc=btc_amount, eth=eth_amount, zscore=zscore)
-            return pos
+            self.open = c
+            log.info("paper_buy", symbol=signal.symbol, type=contract_type, stake=stake)
+            return c
 
         try:
-            if state == PositionState.LONG_SPREAD:
-                btc_price_limit = await self._limit_price(self.leg_a, buy=True)
-                eth_price_limit = await self._limit_price(self.leg_b, buy=False)
-                await self.client.buy(self.leg_a, btc_amount, "limit", btc_price_limit, self.execution.post_only)
-                await self.client.sell(self.leg_b, eth_amount, "limit", eth_price_limit, self.execution.post_only)
-            else:
-                btc_price_limit = await self._limit_price(self.leg_a, buy=False)
-                eth_price_limit = await self._limit_price(self.leg_b, buy=True)
-                await self.client.sell(self.leg_a, btc_amount, "limit", btc_price_limit, self.execution.post_only)
-                await self.client.buy(self.leg_b, eth_amount, "limit", eth_price_limit, self.execution.post_only)
-
-            pos = OpenPosition(
-                state=state,
-                btc_amount=btc_amount,
-                eth_amount=eth_amount,
-                entry_btc=btc_price,
-                entry_eth=eth_price,
-                entry_zscore=zscore,
+            proposal = await self.client.get_proposal(
+                signal.symbol, contract_type, stake, duration, unit, self.risk.currency
             )
-            self.position = pos
-            log.info("live_open", state=state.value, btc=btc_amount, eth=eth_amount)
-            return pos
+            buy = await self.client.buy(proposal["id"], float(proposal["ask_price"]))
+            c = OpenContract(
+                contract_id=str(buy["contract_id"]),
+                symbol=signal.symbol,
+                contract_type=contract_type,
+                stake=stake,
+                entry_epoch=int(time.time()),
+            )
+            self.open = c
+            log.info("live_buy", contract_id=c.contract_id, symbol=signal.symbol, stake=stake)
+            return c
         except Exception as exc:
-            log.error("open_failed", error=str(exc))
-            await self.client.cancel_all()
+            log.error("buy_failed", error=str(exc))
             return None
 
-    async def close_spread(self, btc_price: float, eth_price: float) -> float:
-        if not self.position:
+    async def settle_paper(self, won: bool, payout: float = 0.0) -> float:
+        if not self.open or not self.open.paper:
             return 0.0
-
-        pnl = self.unrealized_pnl(btc_price, eth_price)
-        pos = self.position
-
-        if not self.client.paper_mode:
-            try:
-                if pos.state == PositionState.LONG_SPREAD:
-                    await self.client.sell(self.leg_a, pos.btc_amount, "market")
-                    await self.client.buy(self.leg_b, pos.eth_amount, "market")
-                else:
-                    await self.client.buy(self.leg_a, pos.btc_amount, "market")
-                    await self.client.sell(self.leg_b, pos.eth_amount, "market")
-            except Exception as exc:
-                log.error("close_failed", error=str(exc))
-                return 0.0
-        else:
-            self.paper.close(pos, pnl)
-
-        log.info("position_closed", pnl_usd=round(pnl, 4), state=pos.state.value)
-        self.position = None
+        stake = self.open.stake
+        pnl = (payout - stake) if won else -stake
+        if payout == 0.0 and won:
+            pnl = stake * 0.92  # typical ~92% return on win
+        self._paper_balance_delta += pnl
+        log.info("paper_settle", won=won, pnl=round(pnl, 4))
+        self.open = None
         return pnl
+
+    async def close_live(self, profit: float) -> float:
+        if not self.open or self.open.paper:
+            return 0.0
+        try:
+            await self.client.sell(int(self.open.contract_id))
+        except Exception:
+            pass
+        self.open = None
+        return profit
+
+    def on_contract_update(self, data: dict) -> float | None:
+        """Returns realized PnL when contract closes."""
+        if not self.open or self.open.paper:
+            return None
+        if data.get("is_sold") or data.get("status") == "lost":
+            profit = float(data.get("profit", 0))
+            self.open = None
+            return profit
+        return None

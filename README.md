@@ -1,105 +1,85 @@
-# Deribit Autonomous Profit Bot
+# Deriv Autonomous Volatility Pair Bot
 
-Fully autonomous demo trading bot for [Deribit testnet](https://test.deribit.com) with **real market data** over WebSocket. Targets **$5/day profit** (configurable) using advanced statistical methods — **no lagging indicators** (no RSI, MACD, moving averages).
+Fully autonomous demo trading bot for [Deriv](https://deriv.com) **synthetic volatility indices** — **Volatility 10, 25, 50, 75** (`R_10`, `R_25`, `R_50`, `R_75`). Uses **real tick data** via WebSocket. Targets **$5/day profit** with **low worst-case drawdown** through fixed-stake contracts.
 
-## Strategy
+> **Not Deribit.** This bot connects to Deriv's API (`ws.derivws.com`), not the crypto exchange Deribit.
 
-The bot trades a **synthetic BTC/ETH log-spread** pair:
+## Synthetic Volatility Pairs
+
+Deriv generates these indices algorithmically at **fixed volatility levels**:
+
+| Symbol | Index | Volatility | Tick speed |
+|--------|-------|------------|------------|
+| `R_10` | Volatility 10 | 10% | every 2s |
+| `R_25` | Volatility 25 | 25% | every 2s |
+| `R_50` | Volatility 50 | 50% | every 2s |
+| `R_75` | Volatility 75 | 75% | every 2s |
+
+1-second variants: `1HZ10V`, `1HZ25V`, `1HZ50V`, `1HZ75V`.
+
+## Strategy (no RSI / MACD / MA)
+
+**Vol-normalized pair spread** between high-vol and low-vol indices:
 
 ```
-spread = log(BTC) − β × log(ETH)
+spread = EWMA_norm_return(R_75) − EWMA_norm_return(R_10)
 ```
 
-| Component | Method |
-|-----------|--------|
-| Fair value & hedge ratio | Online **Kalman filter** (dynamic β) |
-| Entry/exit | Innovation **z-score** mean reversion |
-| Timing | **Order-book imbalance** microstructure |
-| Carry bias | **Funding rate** differential between perps |
+Each return is scaled by that index's theoretical vol (10%, 25%, etc.) so moves are comparable across pairs.
 
-When the spread deviates from Kalman fair value beyond a threshold, the bot opens a hedged pair trade (long BTC / short ETH or vice versa) and closes on mean reversion or daily risk limits.
+| Layer | Method |
+|-------|--------|
+| Fair value | **Kalman filter** on spread |
+| Entry | Innovation **z-score** > 1.8 |
+| Leg selection | Most misaligned index in basket |
+| Execution | **CALL/PUT** over 5 ticks — stake = max loss |
 
-## Features
+### Why lower drawdown than perps
 
-- Real-time Deribit WebSocket (tickers + order books)
-- Testnet live orders or **paper mode** without API keys
-- Daily P&L tracking with $5 profit target and loss limit
-- SQLite persistence for trades and snapshots
-- Autonomous loop: subscribe → signal → execute → reconcile
+Deriv options use **fixed stake** = **maximum loss per trade** (e.g. $0.35–$2). Combined with:
+
+- 5% daily loss limit (% of balance)
+- 10% max drawdown circuit breaker
+- One open contract at a time
 
 ## Quick Start
 
-### 1. Install
-
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### 2. Configure (optional for paper mode)
-
-```bash
 cp .env.example .env
-```
-
-Get testnet API keys at [test.deribit.com](https://test.deribit.com) → Account → API.
-
-```env
-DERIBIT_CLIENT_ID=your_client_id
-DERIBIT_CLIENT_SECRET=your_client_secret
-DERIBIT_ENV=testnet
-DAILY_PROFIT_TARGET_USD=5.0
-```
-
-Without keys, the bot runs in **paper mode**: real data, simulated fills.
-
-### 3. Run
-
-```bash
-chmod +x scripts/run_bot.sh
+# Optional: DERIV_API_TOKEN from https://app.deriv.com/account/api-token
 ./scripts/run_bot.sh
 ```
 
-Or:
-
-```bash
-PYTHONPATH=. python -m src.main
-```
-
-Press `Ctrl+C` to stop gracefully (open positions are closed).
+Without API token → **paper mode** (real ticks, simulated wins/losses).
 
 ## Configuration
 
-Edit `config/settings.yaml`:
+`config/settings.yaml`:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `risk.daily_profit_target_usd` | 5.0 | Stop new trades after reaching target |
-| `risk.daily_loss_limit_usd` | 15.0 | Halt trading on max daily loss |
-| `strategy.entry_zscore` | 2.0 | Min z-score to enter |
-| `strategy.exit_zscore` | 0.4 | Exit when spread reverts |
-| `risk.max_position_usd` | 500 | Max notional per leg |
+| `risk.daily_profit_target_usd` | 5.0 | Halt after +$5 |
+| `risk.max_daily_loss_pct` | 0.05 | 5% of balance/day |
+| `risk.max_drawdown_pct` | 0.10 | 10% session drawdown halt |
+| `risk.max_stake_usd` | 2.0 | Max loss per contract |
+| `strategy.spread_pair_low` | R_10 | Low-vol leg |
+| `strategy.spread_pair_high` | R_75 | High-vol leg |
 
 ## Architecture
 
 ```
 src/
-├── main.py              # Autonomous event loop
-├── api/client.py        # Deribit WebSocket JSON-RPC
+├── main.py                 # Autonomous loop
+├── api/client.py           # Deriv WebSocket API
 ├── strategy/
-│   ├── kalman.py        # Dynamic hedge ratio filter
-│   ├── microstructure.py# Order-book imbalance
-│   └── engine.py        # Signal fusion
-├── risk/manager.py      # Daily target & position sizing
-├── execution/order_manager.py
-└── storage/state.py     # SQLite persistence
+│   ├── vol_normalize.py    # Vol-scaled returns across V10–V75
+│   ├── kalman.py           # Spread fair value
+│   └── engine.py           # Signal + leg picker
+├── risk/manager.py         # % equity limits + stake sizing
+└── execution/order_manager.py  # proposal → buy
 ```
 
 ## Risk Disclaimer
 
-This is for **Deribit testnet / educational use only**. Past simulated performance does not guarantee future results. Crypto derivatives involve substantial risk. Never deploy unreviewed bots with real funds.
-
-## License
-
-MIT
+Demo/educational use only. Synthetic indices are RNG-driven; no strategy guarantees profit. Never trade live without thorough testing.
