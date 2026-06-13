@@ -1,0 +1,45 @@
+deribit:
+  testnet:
+    http: https://test.deribit.com/api/v2
+    ws: wss://test.deribit.com/ws/api/v2
+  mainnet:
+    http: https://www.deribit.com/api/v2
+    ws: wss://www.deribit.com/ws/api/v2
+
+instruments:
+  leg_a: BTC-PERPETUAL
+  leg_b: ETH-PERPETUAL
+  currency: BTC
+
+strategy:
+  # Synthetic log-spread: log(BTC) - beta * log(ETH)
+  kalman:
+    process_noise: 1.0e-5
+    observation_noise: 1.0e-3
+    beta_init: 1.35
+  # Enter when normalized innovation exceeds threshold (std devs)
+  entry_zscore: 2.0
+  exit_zscore: 0.4
+  # Order book imbalance weight (microstructure, not indicators)
+  obi_weight: 0.35
+  funding_weight: 0.15
+  min_confidence: 0.55
+  warmup_ticks: 120
+
+risk:
+  daily_profit_target_usd: 5.0
+  daily_loss_limit_usd: 15.0
+  max_position_usd: 500.0
+  max_open_trades: 2
+  stop_loss_pct: 0.8
+
+execution:
+  order_type: limit
+  post_only: true
+  tick_offset: 1
+  reconcile_interval_sec: 30
+
+bot:
+  heartbeat_sec: 10
+  state_db: data/bot_state.db
+  log_level: INFO
