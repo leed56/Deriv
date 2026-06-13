@@ -34,18 +34,24 @@ Each return is scaled by that index's theoretical vol (10%, 25%, etc.) so moves 
 | Leg selection | Most misaligned index in basket |
 | Execution | **CALL/PUT** over 5 ticks — stake = max loss |
 
-### Why lower drawdown than perps
+### Profit-first design
 
-Deriv options use **fixed stake** = **maximum loss per trade** (e.g. $0.35–$2). Combined with:
+The bot's **primary goal is +$5/day**. When hit, it **stops trading for the day** (`profit_day_complete`) — that is success, not failure.
 
-- 5% daily loss limit (% of balance)
-- 10% intraday drawdown circuit breaker
-- **20% lifetime drawdown** from all-time peak — halts across days until manual reset
-- **3 consecutive losing days** — permanent halt until manual reset
-- One open contract at a time
-- **Restart-safe limits** — all counters persist in `data/bot_state.db`
+| Mechanism | Purpose |
+|-----------|---------|
+| **Dual-spread consensus** | R_75/R_10 AND R_50/R_25 must agree — fewer bad entries |
+| **Payout filter** | Skip trades where payout ratio < 1.85 |
+| **Stake scales up on wins** | +8% multiplier per win (cap 1.0) |
+| **Stake scales down on losses** | ×0.7 per loss — survive to next opportunity |
+| **8h cooldown** after bad streak | Pauses, then resumes at 50% size — not permanent halt |
 
-To manually reset after a lifetime halt: `rm data/bot_state.db`
+### Risk limits (secondary to profit)
+
+- 5% daily loss cap
+- 10% intraday drawdown
+- After 4 losing days: 8h cooldown + smaller stakes
+- Fixed stake per contract = max loss per trade
 
 ## Quick Start
 

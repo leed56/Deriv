@@ -28,13 +28,14 @@ class VolPairSignal:
 
 class VolPairEngine:
     """
-    Synthetic volatility pair strategy across Deriv V10/V25/V50/V75.
+    Profit-focused vol pair strategy across Deriv V10/V25/V50/V75.
 
-    Builds spread = normalized_momentum(R_75) - normalized_momentum(R_10)
-    scaled by each index's fixed vol parameter (10%, 25%, 50%, 75%).
+    Uses TWO synthetic spreads for higher-quality entries:
+      primary: R_75 vs R_10  (wide vol gap)
+      confirm: R_50 vs R_25  (mid vol gap)
 
-    Uses Kalman innovation z-scores — not RSI/MACD/MA.
-  """
+    Trades only when both spreads agree on direction (consensus).
+    """
 
     def __init__(self, config: StrategyConfig, legs: list[VolPairLeg]) -> None:
         self.config = config
@@ -42,16 +43,31 @@ class VolPairEngine:
         self.book = VolPairBook()
         for leg in legs:
             self.book.ensure(leg.symbol, leg.vol_pct)
-        self.kalman = KalmanSpreadFilter(
+        self.kalman_primary = KalmanSpreadFilter(
             process_noise=config.kalman.process_noise,
             observation_noise=config.kalman.observation_noise,
-            beta_init=1.0,
+        )
+        self.kalman_confirm = KalmanSpreadFilter(
+            process_noise=config.kalman.process_noise,
+            observation_noise=config.kalman.observation_noise,
         )
         self._tick_count = 0
         self._in_contract = False
+        self._recent_results: list[float] = []
 
     def set_in_contract(self, active: bool) -> None:
         self._in_contract = active
+
+    def record_result(self, pnl: float) -> None:
+        self._recent_results.append(pnl)
+        if len(self._recent_results) > 20:
+            self._recent_results.pop(0)
+
+    @property
+    def recent_win_rate(self) -> float:
+        if not self._recent_results:
+            return 0.55
+        return sum(1 for x in self._recent_results if x > 0) / len(self._recent_results)
 
     def on_tick(self, symbol: str, quote: float, epoch: int) -> VolPairSignal | None:
         leg = next((l for l in self.legs if l.symbol == symbol), None)
@@ -67,31 +83,46 @@ class VolPairEngine:
     def evaluate(self) -> VolPairSignal:
         low = self.config.spread_pair_low
         high = self.config.spread_pair_high
-        spread = self.book.momentum_spread(low, high)
-        _, _, zscore = self.kalman.update(spread, 0.0)  # univariate spread filter
+        mid_low = self.config.spread_pair_mid_low
+        mid_high = self.config.spread_pair_mid_high
+
+        spread_p = self.book.momentum_spread(low, high)
+        spread_c = self.book.momentum_spread(mid_low, mid_high)
+        _, _, z_p = self.kalman_primary.update(spread_p, 0.0)
+        _, _, z_c = self.kalman_confirm.update(spread_c, 0.0)
+        zscore = (z_p + z_c) / 2.0
+        spread = spread_p
 
         if self._tick_count < self.config.warmup_ticks or not self.book.ready():
-            return VolPairSignal(TradeAction.FLAT, "", 0.0, zscore, spread, self.kalman.fair_spread, "warmup")
+            return VolPairSignal(TradeAction.FLAT, "", 0.0, zscore, spread, self.kalman_primary.fair_spread, "warmup")
 
         if self._in_contract:
-            if abs(zscore) < self.config.exit_zscore:
-                return VolPairSignal(TradeAction.FLAT, "", 0.9, zscore, spread, self.kalman.fair_spread, "revert_exit")
-            return VolPairSignal(TradeAction.FLAT, "", 0.0, zscore, spread, self.kalman.fair_spread, "hold_contract")
+            return VolPairSignal(TradeAction.FLAT, "", 0.0, zscore, spread, self.kalman_primary.fair_spread, "hold_contract")
 
-        confidence = min(1.0, abs(zscore) / self.config.entry_zscore)
-        if abs(zscore) < self.config.entry_zscore or confidence < self.config.min_confidence:
-            return VolPairSignal(TradeAction.FLAT, "", confidence, zscore, spread, self.kalman.fair_spread, "no_edge")
+        # Consensus: both spreads must agree on direction
+        if z_p * z_c <= 0:
+            return VolPairSignal(TradeAction.FLAT, "", 0.0, zscore, spread, self.kalman_primary.fair_spread, "no_consensus")
 
-        # Pick the most misaligned leg to trade (max drawdown control: one contract)
+        if abs(z_p) < self.config.entry_zscore or abs(z_c) < self.config.entry_zscore * 0.8:
+            return VolPairSignal(TradeAction.FLAT, "", 0.0, zscore, spread, self.kalman_primary.fair_spread, "no_edge")
+
+        confidence = min(1.0, (abs(z_p) + abs(z_c)) / (2 * self.config.entry_zscore))
+        # Boost confidence when recent win rate is good
+        confidence = min(1.0, confidence * (0.85 + 0.3 * self.recent_win_rate))
+
+        if confidence < self.config.min_confidence:
+            return VolPairSignal(TradeAction.FLAT, "", confidence, zscore, spread, self.kalman_primary.fair_spread, "low_confidence")
+
         pressure = self.book.basket_pressure()
+        # Prefer R_25/R_50 for execution — better win rate than extremes
+        preferred = [mid_low, mid_high, low, high]
         if zscore > 0:
-            # Spread too high: high-vol index overshooting → PUT it, or CALL low-vol
-            sym = high if pressure.get(high, 0) > abs(pressure.get(low, 0)) else low
-            action = TradeAction.PUT if sym == high else TradeAction.CALL
-            reason = "high_vol_overextended"
+            sym = next((s for s in preferred if pressure.get(s, 0) > 0.05), high)
+            action = TradeAction.PUT if sym in (high, mid_high) else TradeAction.CALL
+            reason = "consensus_short_spread"
         else:
-            sym = low if pressure.get(low, 0) < -abs(pressure.get(high, 0)) else high
-            action = TradeAction.PUT if sym == high else TradeAction.CALL
-            reason = "low_vol_underextended"
+            sym = next((s for s in preferred if pressure.get(s, 0) < -0.05), low)
+            action = TradeAction.CALL if sym in (low, mid_low) else TradeAction.PUT
+            reason = "consensus_long_spread"
 
-        return VolPairSignal(action, sym, confidence, zscore, spread, self.kalman.fair_spread, reason)
+        return VolPairSignal(action, sym, confidence, zscore, spread, self.kalman_primary.fair_spread, reason)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 
 @dataclass
@@ -11,48 +11,50 @@ class DailyPnLTracker:
     max_drawdown_pct: float
     max_lifetime_drawdown_pct: float
     max_consecutive_loss_days: int
+    cooldown_hours: int
     anchor_balance: float
     peak_balance: float
     lifetime_peak_balance: float
     lifetime_anchor_balance: float
     realized_pnl_usd: float = 0.0
     trades_today: int = 0
+    wins_today: int = 0
+    losses_today: int = 0
     trading_day: date = field(default_factory=lambda: datetime.now(timezone.utc).date())
     halted: bool = False
     halt_reason: str = ""
-    lifetime_halted: bool = False
-    lifetime_halt_reason: str = ""
+    profit_day_locked: bool = False
     consecutive_loss_days: int = 0
+    stake_multiplier: float = 1.0
+    cooldown_until: datetime | None = None
 
     def sync_day(self, balance: float, today: date | None = None) -> bool:
-        """
-        Roll to a new UTC day. Daily counters reset; lifetime limits never reset.
-        Returns True if the calendar day rolled.
-        """
         today = today or datetime.now(timezone.utc).date()
         if today == self.trading_day:
             self.peak_balance = max(self.peak_balance, balance)
             self.lifetime_peak_balance = max(self.lifetime_peak_balance, balance)
             return False
 
-        # Close out prior day for streak tracking
         if self.realized_pnl_usd < 0:
             self.consecutive_loss_days += 1
         elif self.realized_pnl_usd > 0:
             self.consecutive_loss_days = 0
+            # Recovery: nudge stake back up after a green day
+            self.stake_multiplier = min(1.0, self.stake_multiplier + 0.15)
 
         self.trading_day = today
         self.anchor_balance = balance
         self.peak_balance = balance
         self.realized_pnl_usd = 0.0
         self.trades_today = 0
+        self.wins_today = 0
+        self.losses_today = 0
+        self.halted = False
+        self.halt_reason = ""
+        self.profit_day_locked = False
 
-        # Daily halt clears on new day — lifetime halt does not
-        if not self.lifetime_halted:
-            self.halted = False
-            self.halt_reason = ""
-
-        self._check_lifetime(balance)
+        self._apply_streak_cooldown()
+        self._check_lifetime_soft(balance)
         return True
 
     @property
@@ -60,8 +62,21 @@ class DailyPnLTracker:
         return self.realized_pnl_usd
 
     @property
+    def in_cooldown(self) -> bool:
+        if self.cooldown_until is None:
+            return False
+        if datetime.now(timezone.utc) >= self.cooldown_until:
+            self.cooldown_until = None
+            return False
+        return True
+
+    @property
     def is_blocked(self) -> bool:
-        return self.halted or self.lifetime_halted
+        if self.profit_day_locked:
+            return True
+        if self.in_cooldown:
+            return True
+        return self.halted
 
     _current_balance_hint: float = field(default=0.0, repr=False)
 
@@ -75,23 +90,29 @@ class DailyPnLTracker:
         self.bind_balance(balance)
         self.realized_pnl_usd += pnl_usd
         self.trades_today += 1
+        if pnl_usd >= 0:
+            self.wins_today += 1
+            self.stake_multiplier = min(1.0, self.stake_multiplier + 0.08)
+        else:
+            self.losses_today += 1
+            self.stake_multiplier = max(0.4, self.stake_multiplier * 0.7)
         self._check(balance)
 
     def check_equity(self, balance: float) -> None:
         self.bind_balance(balance)
-        if self.lifetime_halted:
+        if self.profit_day_locked:
+            return
+        if self.in_cooldown:
             return
         if not self.halted:
             self._check(balance)
-        else:
-            self._check_lifetime(balance)
 
     def _check(self, balance: float) -> None:
-        if self.lifetime_halted:
-            return
-
+        # PRIMARY GOAL: lock in daily profit
         if self.realized_pnl_usd >= self.target_usd:
-            self._halt_daily(f"target_reached_{self.target_usd:.2f}")
+            self.profit_day_locked = True
+            self.halted = True
+            self.halt_reason = f"profit_locked_{self.target_usd:.2f}"
             return
 
         daily_loss_cap = self.anchor_balance * self.max_daily_loss_pct
@@ -105,29 +126,31 @@ class DailyPnLTracker:
                 self._halt_daily(f"intraday_drawdown_{self.max_drawdown_pct:.0%}")
                 return
 
-        self._check_lifetime(balance)
+        self._check_lifetime_soft(balance)
 
-    def _check_lifetime(self, balance: float) -> None:
+    def _check_lifetime_soft(self, balance: float) -> None:
+        """Reduce size + short cooldown instead of permanent shutdown."""
         if self.lifetime_peak_balance > 0:
             lifetime_dd = (self.lifetime_peak_balance - balance) / self.lifetime_peak_balance
             if lifetime_dd >= self.max_lifetime_drawdown_pct:
-                self._halt_lifetime(
-                    f"lifetime_drawdown_{self.max_lifetime_drawdown_pct:.0%}"
-                )
+                self.stake_multiplier = 0.4
+                self._set_cooldown(hours=self.cooldown_hours * 2)
                 return
 
         if self.consecutive_loss_days >= self.max_consecutive_loss_days:
-            self._halt_lifetime(
-                f"consecutive_loss_days_{self.consecutive_loss_days}"
-            )
+            self._apply_streak_cooldown()
+
+    def _apply_streak_cooldown(self) -> None:
+        if self.consecutive_loss_days >= self.max_consecutive_loss_days:
+            self.stake_multiplier = min(self.stake_multiplier, 0.5)
+            self._set_cooldown(hours=self.cooldown_hours)
+
+    def _set_cooldown(self, hours: int) -> None:
+        until = datetime.now(timezone.utc) + timedelta(hours=hours)
+        if self.cooldown_until is None or until > self.cooldown_until:
+            self.cooldown_until = until
 
     def _halt_daily(self, reason: str) -> None:
-        self.halted = True
-        self.halt_reason = reason
-
-    def _halt_lifetime(self, reason: str) -> None:
-        self.lifetime_halted = True
-        self.lifetime_halt_reason = reason
         self.halted = True
         self.halt_reason = reason
 
@@ -141,6 +164,6 @@ class StakeSizer:
     min_stake_usd: float
     stake_pct: float
 
-    def stake(self, balance: float, confidence: float) -> float:
-        raw = balance * self.stake_pct * min(1.0, confidence)
+    def stake(self, balance: float, confidence: float, multiplier: float = 1.0) -> float:
+        raw = balance * self.stake_pct * min(1.0, confidence) * multiplier
         return round(max(self.min_stake_usd, min(self.max_stake_usd, raw)), 2)

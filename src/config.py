@@ -28,11 +28,14 @@ class KalmanConfig:
 class StrategyConfig:
     spread_pair_low: str
     spread_pair_high: str
+    spread_pair_mid_low: str
+    spread_pair_mid_high: str
     kalman: KalmanConfig
-    entry_zscore: float = 1.8
+    entry_zscore: float = 2.0
     exit_zscore: float = 0.35
-    min_confidence: float = 0.52
-    warmup_ticks: int = 60
+    min_confidence: float = 0.58
+    min_payout_ratio: float = 1.85
+    warmup_ticks: int = 80
     contract_duration: int = 5
     contract_duration_unit: str = "t"
 
@@ -42,11 +45,12 @@ class RiskConfig:
     daily_profit_target_usd: float = 5.0
     max_daily_loss_pct: float = 0.05
     max_drawdown_pct: float = 0.10
-    max_lifetime_drawdown_pct: float = 0.20
-    max_consecutive_loss_days: int = 3
+    max_lifetime_drawdown_pct: float = 0.25
+    max_consecutive_loss_days: int = 4
+    cooldown_hours: int = 8
     max_stake_usd: float = 2.0
     min_stake_usd: float = 0.35
-    stake_pct_of_balance: float = 0.02
+    stake_pct_of_balance: float = 0.025
     max_open_contracts: int = 1
     currency: str = "USD"
 
@@ -83,16 +87,20 @@ def load_settings() -> Settings:
         risk = {**risk, "daily_profit_target_usd": float(os.getenv("DAILY_PROFIT_TARGET_USD", "5"))}
 
     kalman_raw = raw["strategy"]["kalman"]
+    s = raw["strategy"]
     strategy = StrategyConfig(
-        spread_pair_low=raw["strategy"]["spread_pair_low"],
-        spread_pair_high=raw["strategy"]["spread_pair_high"],
+        spread_pair_low=s["spread_pair_low"],
+        spread_pair_high=s["spread_pair_high"],
+        spread_pair_mid_low=s["spread_pair_mid_low"],
+        spread_pair_mid_high=s["spread_pair_mid_high"],
         kalman=KalmanConfig(**kalman_raw),
-        entry_zscore=raw["strategy"]["entry_zscore"],
-        exit_zscore=raw["strategy"]["exit_zscore"],
-        min_confidence=raw["strategy"]["min_confidence"],
-        warmup_ticks=raw["strategy"]["warmup_ticks"],
-        contract_duration=raw["strategy"]["contract_duration"],
-        contract_duration_unit=raw["strategy"]["contract_duration_unit"],
+        entry_zscore=s["entry_zscore"],
+        exit_zscore=s["exit_zscore"],
+        min_confidence=s["min_confidence"],
+        min_payout_ratio=s.get("min_payout_ratio", 1.85),
+        warmup_ticks=s["warmup_ticks"],
+        contract_duration=s["contract_duration"],
+        contract_duration_unit=s["contract_duration_unit"],
     )
 
     vol_pairs = [VolPairLeg(**leg) for leg in raw["vol_pairs"]]

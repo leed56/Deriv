@@ -63,7 +63,13 @@ class ContractManager:
             proposal = await self.client.get_proposal(
                 signal.symbol, contract_type, stake, duration, unit, self.risk.currency
             )
-            buy = await self.client.buy(proposal["id"], float(proposal["ask_price"]))
+            payout = float(proposal.get("payout", 0))
+            ask = float(proposal.get("ask_price", stake))
+            ratio = payout / max(ask, 0.01)
+            if ratio < self.strategy.min_payout_ratio:
+                log.info("skip_low_payout", symbol=signal.symbol, ratio=round(ratio, 2))
+                return None
+            buy = await self.client.buy(proposal["id"], ask)
             c = OpenContract(
                 contract_id=str(buy["contract_id"]),
                 symbol=signal.symbol,

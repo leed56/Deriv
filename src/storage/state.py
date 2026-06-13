@@ -14,14 +14,17 @@ class RiskState:
     peak_balance: float
     realized_pnl_usd: float
     trades_today: int
+    wins_today: int
+    losses_today: int
     halted: bool
     halt_reason: str
+    profit_day_locked: bool
     paper_balance: float
     lifetime_peak_balance: float
     lifetime_anchor_balance: float
-    lifetime_halted: bool
-    lifetime_halt_reason: str
     consecutive_loss_days: int
+    stake_multiplier: float
+    cooldown_until: str
 
 
 class StateStore:
@@ -39,14 +42,17 @@ class StateStore:
                     peak_balance REAL NOT NULL,
                     realized_pnl_usd REAL NOT NULL DEFAULT 0,
                     trades_today INTEGER NOT NULL DEFAULT 0,
+                    wins_today INTEGER NOT NULL DEFAULT 0,
+                    losses_today INTEGER NOT NULL DEFAULT 0,
                     halted INTEGER NOT NULL DEFAULT 0,
                     halt_reason TEXT NOT NULL DEFAULT '',
+                    profit_day_locked INTEGER NOT NULL DEFAULT 0,
                     paper_balance REAL NOT NULL DEFAULT 10000,
                     lifetime_peak_balance REAL NOT NULL DEFAULT 10000,
                     lifetime_anchor_balance REAL NOT NULL DEFAULT 10000,
-                    lifetime_halted INTEGER NOT NULL DEFAULT 0,
-                    lifetime_halt_reason TEXT NOT NULL DEFAULT '',
-                    consecutive_loss_days INTEGER NOT NULL DEFAULT 0
+                    consecutive_loss_days INTEGER NOT NULL DEFAULT 0,
+                    stake_multiplier REAL NOT NULL DEFAULT 1.0,
+                    cooldown_until TEXT NOT NULL DEFAULT ''
                 )"""
             )
             await self._migrate_columns(db)
@@ -64,10 +70,13 @@ class StateStore:
         async with db.execute("PRAGMA table_info(risk_state)") as cur:
             cols = {row[1] for row in await cur.fetchall()}
         migrations = {
+            "wins_today": "INTEGER NOT NULL DEFAULT 0",
+            "losses_today": "INTEGER NOT NULL DEFAULT 0",
+            "profit_day_locked": "INTEGER NOT NULL DEFAULT 0",
+            "stake_multiplier": "REAL NOT NULL DEFAULT 1.0",
+            "cooldown_until": "TEXT NOT NULL DEFAULT ''",
             "lifetime_peak_balance": "REAL NOT NULL DEFAULT 10000",
             "lifetime_anchor_balance": "REAL NOT NULL DEFAULT 10000",
-            "lifetime_halted": "INTEGER NOT NULL DEFAULT 0",
-            "lifetime_halt_reason": "TEXT NOT NULL DEFAULT ''",
             "consecutive_loss_days": "INTEGER NOT NULL DEFAULT 0",
         }
         for col, typedef in migrations.items():
@@ -78,9 +87,10 @@ class StateStore:
         async with aiosqlite.connect(self.path) as db:
             async with db.execute(
                 "SELECT trading_day, anchor_balance, peak_balance, realized_pnl_usd, "
-                "trades_today, halted, halt_reason, paper_balance, "
-                "lifetime_peak_balance, lifetime_anchor_balance, lifetime_halted, "
-                "lifetime_halt_reason, consecutive_loss_days FROM risk_state WHERE id = 1"
+                "trades_today, wins_today, losses_today, halted, halt_reason, "
+                "profit_day_locked, paper_balance, lifetime_peak_balance, "
+                "lifetime_anchor_balance, consecutive_loss_days, stake_multiplier, "
+                "cooldown_until FROM risk_state WHERE id = 1"
             ) as cur:
                 row = await cur.fetchone()
                 if not row:
@@ -91,68 +101,64 @@ class StateStore:
                     peak_balance=float(row[2]),
                     realized_pnl_usd=float(row[3]),
                     trades_today=int(row[4]),
-                    halted=bool(row[5]),
-                    halt_reason=row[6] or "",
-                    paper_balance=float(row[7]),
-                    lifetime_peak_balance=float(row[8]),
-                    lifetime_anchor_balance=float(row[9]),
-                    lifetime_halted=bool(row[10]),
-                    lifetime_halt_reason=row[11] or "",
-                    consecutive_loss_days=int(row[12]),
+                    wins_today=int(row[5]),
+                    losses_today=int(row[6]),
+                    halted=bool(row[7]),
+                    halt_reason=row[8] or "",
+                    profit_day_locked=bool(row[9]),
+                    paper_balance=float(row[10]),
+                    lifetime_peak_balance=float(row[11]),
+                    lifetime_anchor_balance=float(row[12]),
+                    consecutive_loss_days=int(row[13]),
+                    stake_multiplier=float(row[14]),
+                    cooldown_until=row[15] or "",
                 )
 
-    async def save_risk_state(
-        self,
-        trading_day: date,
-        anchor_balance: float,
-        peak_balance: float,
-        realized_pnl_usd: float,
-        trades_today: int,
-        halted: bool,
-        halt_reason: str,
-        paper_balance: float,
-        lifetime_peak_balance: float,
-        lifetime_anchor_balance: float,
-        lifetime_halted: bool,
-        lifetime_halt_reason: str,
-        consecutive_loss_days: int,
-    ) -> None:
+    async def save_risk_state(self, **kwargs: object) -> None:
+        trading_day: date = kwargs["trading_day"]  # type: ignore[assignment]
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
                 """INSERT INTO risk_state(
                        id, trading_day, anchor_balance, peak_balance, realized_pnl_usd,
-                       trades_today, halted, halt_reason, paper_balance,
-                       lifetime_peak_balance, lifetime_anchor_balance,
-                       lifetime_halted, lifetime_halt_reason, consecutive_loss_days)
-                   VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       trades_today, wins_today, losses_today, halted, halt_reason,
+                       profit_day_locked, paper_balance, lifetime_peak_balance,
+                       lifetime_anchor_balance, consecutive_loss_days, stake_multiplier,
+                       cooldown_until)
+                   VALUES (1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
                        trading_day=excluded.trading_day,
                        anchor_balance=excluded.anchor_balance,
                        peak_balance=excluded.peak_balance,
                        realized_pnl_usd=excluded.realized_pnl_usd,
                        trades_today=excluded.trades_today,
+                       wins_today=excluded.wins_today,
+                       losses_today=excluded.losses_today,
                        halted=excluded.halted,
                        halt_reason=excluded.halt_reason,
+                       profit_day_locked=excluded.profit_day_locked,
                        paper_balance=excluded.paper_balance,
                        lifetime_peak_balance=excluded.lifetime_peak_balance,
                        lifetime_anchor_balance=excluded.lifetime_anchor_balance,
-                       lifetime_halted=excluded.lifetime_halted,
-                       lifetime_halt_reason=excluded.lifetime_halt_reason,
-                       consecutive_loss_days=excluded.consecutive_loss_days""",
+                       consecutive_loss_days=excluded.consecutive_loss_days,
+                       stake_multiplier=excluded.stake_multiplier,
+                       cooldown_until=excluded.cooldown_until""",
                 (
                     trading_day.isoformat(),
-                    anchor_balance,
-                    peak_balance,
-                    realized_pnl_usd,
-                    trades_today,
-                    int(halted),
-                    halt_reason,
-                    paper_balance,
-                    lifetime_peak_balance,
-                    lifetime_anchor_balance,
-                    int(lifetime_halted),
-                    lifetime_halt_reason,
-                    consecutive_loss_days,
+                    kwargs["anchor_balance"],
+                    kwargs["peak_balance"],
+                    kwargs["realized_pnl_usd"],
+                    kwargs["trades_today"],
+                    kwargs["wins_today"],
+                    kwargs["losses_today"],
+                    int(kwargs["halted"]),
+                    kwargs["halt_reason"],
+                    int(kwargs["profit_day_locked"]),
+                    kwargs["paper_balance"],
+                    kwargs["lifetime_peak_balance"],
+                    kwargs["lifetime_anchor_balance"],
+                    kwargs["consecutive_loss_days"],
+                    kwargs["stake_multiplier"],
+                    kwargs["cooldown_until"],
                 ),
             )
             await db.commit()

@@ -19,29 +19,32 @@ vol_pairs:
     weight: 1.0
 
 strategy:
-  # Compare high-vol vs low-vol normalized momentum spread
+  # Primary spread: wide vol gap | Confirm: mid vol gap
   spread_pair_low: R_10
   spread_pair_high: R_75
+  spread_pair_mid_low: R_25
+  spread_pair_mid_high: R_50
   kalman:
     process_noise: 1.0e-4
     observation_noise: 1.0e-2
-  entry_zscore: 1.8
+  entry_zscore: 2.0
   exit_zscore: 0.35
-  min_confidence: 0.52
-  warmup_ticks: 60
-  # Contract: rise/fall over N ticks
+  min_confidence: 0.58
+  min_payout_ratio: 1.85
+  warmup_ticks: 80
   contract_duration: 5
-  contract_duration_unit: t   # ticks
+  contract_duration_unit: t
 
 risk:
   daily_profit_target_usd: 5.0
-  max_daily_loss_pct: 0.05      # 5% of balance per day
-  max_drawdown_pct: 0.10        # 10% intraday from daily peak
-  max_lifetime_drawdown_pct: 0.20  # 20% from all-time peak — halts across days
-  max_consecutive_loss_days: 3   # stop after 3 losing days in a row
-  max_stake_usd: 2.0            # max loss per contract (= stake)
+  max_daily_loss_pct: 0.05
+  max_drawdown_pct: 0.10
+  max_lifetime_drawdown_pct: 0.25
+  max_consecutive_loss_days: 4
+  cooldown_hours: 8
+  max_stake_usd: 2.0
   min_stake_usd: 0.35
-  stake_pct_of_balance: 0.02    # 2% of balance per trade
+  stake_pct_of_balance: 0.025
   max_open_contracts: 1
   currency: USD
 
