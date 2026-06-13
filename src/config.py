@@ -42,6 +42,8 @@ class RiskConfig:
     daily_profit_target_usd: float = 5.0
     max_daily_loss_pct: float = 0.05
     max_drawdown_pct: float = 0.10
+    max_lifetime_drawdown_pct: float = 0.20
+    max_consecutive_loss_days: int = 3
     max_stake_usd: float = 2.0
     min_stake_usd: float = 0.35
     stake_pct_of_balance: float = 0.02

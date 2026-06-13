@@ -39,11 +39,13 @@ Each return is scaled by that index's theoretical vol (10%, 25%, etc.) so moves 
 Deriv options use **fixed stake** = **maximum loss per trade** (e.g. $0.35–$2). Combined with:
 
 - 5% daily loss limit (% of balance)
-- 10% max drawdown circuit breaker
+- 10% intraday drawdown circuit breaker
+- **20% lifetime drawdown** from all-time peak — halts across days until manual reset
+- **3 consecutive losing days** — permanent halt until manual reset
 - One open contract at a time
-- **Restart-safe limits** — halt state, daily P&L, anchor balance, and peak balance persist in `data/bot_state.db`. Restarting the bot on the same UTC day cannot bypass a halt.
+- **Restart-safe limits** — all counters persist in `data/bot_state.db`
 
-To manually reset after a halt: `rm data/bot_state.db`
+To manually reset after a lifetime halt: `rm data/bot_state.db`
 
 ## Quick Start
 
@@ -64,7 +66,9 @@ Without API token → **paper mode** (real ticks, simulated wins/losses).
 |-----|---------|-------------|
 | `risk.daily_profit_target_usd` | 5.0 | Halt after +$5 |
 | `risk.max_daily_loss_pct` | 0.05 | 5% of balance/day |
-| `risk.max_drawdown_pct` | 0.10 | 10% session drawdown halt |
+| `risk.max_drawdown_pct` | 0.10 | 10% intraday drawdown halt |
+| `risk.max_lifetime_drawdown_pct` | 0.20 | 20% all-time peak drawdown — stops across days |
+| `risk.max_consecutive_loss_days` | 3 | Halt after N losing days in a row |
 | `risk.max_stake_usd` | 2.0 | Max loss per contract |
 | `strategy.spread_pair_low` | R_10 | Low-vol leg |
 | `strategy.spread_pair_high` | R_75 | High-vol leg |

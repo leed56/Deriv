@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import structlog
 
@@ -41,8 +40,12 @@ class DerivVolBot:
             target_usd=self.settings.risk.daily_profit_target_usd,
             max_daily_loss_pct=self.settings.risk.max_daily_loss_pct,
             max_drawdown_pct=self.settings.risk.max_drawdown_pct,
+            max_lifetime_drawdown_pct=self.settings.risk.max_lifetime_drawdown_pct,
+            max_consecutive_loss_days=self.settings.risk.max_consecutive_loss_days,
             anchor_balance=10000.0,
             peak_balance=10000.0,
+            lifetime_peak_balance=10000.0,
+            lifetime_anchor_balance=10000.0,
         )
         self.sizer = StakeSizer(
             self.settings.risk.max_stake_usd,
@@ -73,9 +76,10 @@ class DerivVolBot:
             paper=self.client.paper_mode,
             target_usd=self.settings.risk.daily_profit_target_usd,
             daily_pnl=round(self.pnl.total_pnl_usd, 4),
-            halted=self.pnl.halted,
-            halt_reason=self.pnl.halt_reason or None,
-            anchor_balance=round(self.pnl.anchor_balance, 2),
+            halted=self.pnl.is_blocked,
+            halt_reason=self.pnl.lifetime_halt_reason or self.pnl.halt_reason or None,
+            lifetime_halted=self.pnl.lifetime_halted,
+            consecutive_loss_days=self.pnl.consecutive_loss_days,
         )
 
         reconcile = asyncio.create_task(self._reconcile_loop())
@@ -125,7 +129,7 @@ class DerivVolBot:
         if self.contracts.has_open:
             return
 
-        if self.pnl.halted:
+        if self.pnl.is_blocked:
             return
 
         if not sig or sig.action == TradeAction.FLAT:
@@ -172,17 +176,24 @@ class DerivVolBot:
         saved = await self.store.load_risk_state()
 
         if saved is None:
-            self._paper_start_balance = 10000.0
+            self._paper_start_balance = live_balance
             self.pnl.trading_day = today
             self.pnl.anchor_balance = live_balance
             self.pnl.peak_balance = live_balance
+            self.pnl.lifetime_peak_balance = live_balance
+            self.pnl.lifetime_anchor_balance = live_balance
             return
 
         self._paper_start_balance = saved.paper_balance
         saved_day = date.fromisoformat(saved.trading_day)
 
+        self.pnl.lifetime_peak_balance = saved.lifetime_peak_balance
+        self.pnl.lifetime_anchor_balance = saved.lifetime_anchor_balance
+        self.pnl.lifetime_halted = saved.lifetime_halted
+        self.pnl.lifetime_halt_reason = saved.lifetime_halt_reason
+        self.pnl.consecutive_loss_days = saved.consecutive_loss_days
+
         if saved_day == today:
-            # Same UTC day: restore counters and halt — restart cannot bypass limits
             self.pnl.trading_day = today
             self.pnl.anchor_balance = saved.anchor_balance
             self.pnl.peak_balance = max(saved.peak_balance, live_balance)
@@ -194,14 +205,19 @@ class DerivVolBot:
                 "risk_state_restored",
                 day=saved.trading_day,
                 realized_pnl=saved.realized_pnl_usd,
-                halted=saved.halted,
+                lifetime_halted=saved.lifetime_halted,
             )
         else:
-            # New UTC day: fresh daily budget, keep paper balance continuity
-            self.pnl.sync_day(live_balance, today)
-            if self.client.paper_mode:
-                self.pnl.anchor_balance = self._paper_start_balance
-                self.pnl.peak_balance = self._paper_start_balance
+            # New UTC day: daily budget resets, lifetime limits carry forward
+            balance = self._paper_start_balance if self.client.paper_mode else live_balance
+            self.pnl.trading_day = saved_day  # sync_day needs prior day to count streak
+            self.pnl.realized_pnl_usd = saved.realized_pnl_usd
+            self.pnl.sync_day(balance, today)
+            log.info(
+                "new_trading_day",
+                consecutive_loss_days=self.pnl.consecutive_loss_days,
+                lifetime_halted=self.pnl.lifetime_halted,
+            )
 
     async def _persist_risk_state(self) -> None:
         balance = self._get_balance()
@@ -213,7 +229,12 @@ class DerivVolBot:
             trades_today=self.pnl.trades_today,
             halted=self.pnl.halted,
             halt_reason=self.pnl.halt_reason,
-            paper_balance=self._get_balance() if self.client.paper_mode else self.client.balance,
+            paper_balance=balance if self.client.paper_mode else self.client.balance,
+            lifetime_peak_balance=max(self.pnl.lifetime_peak_balance, balance),
+            lifetime_anchor_balance=self.pnl.lifetime_anchor_balance,
+            lifetime_halted=self.pnl.lifetime_halted,
+            lifetime_halt_reason=self.pnl.lifetime_halt_reason,
+            consecutive_loss_days=self.pnl.consecutive_loss_days,
         )
 
     async def _reconcile_loop(self) -> None:

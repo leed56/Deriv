@@ -35,8 +35,10 @@ strategy:
 
 risk:
   daily_profit_target_usd: 5.0
-  max_daily_loss_pct: 0.05      # 5% of balance
-  max_drawdown_pct: 0.10        # halt at -10% from session start
+  max_daily_loss_pct: 0.05      # 5% of balance per day
+  max_drawdown_pct: 0.10        # 10% intraday from daily peak
+  max_lifetime_drawdown_pct: 0.20  # 20% from all-time peak — halts across days
+  max_consecutive_loss_days: 3   # stop after 3 losing days in a row
   max_stake_usd: 2.0            # max loss per contract (= stake)
   min_stake_usd: 0.35
   stake_pct_of_balance: 0.02    # 2% of balance per trade
