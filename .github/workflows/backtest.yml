@@ -1,0 +1,39 @@
+name: Deriv Strategy Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_token:
+        description: "Deriv demo API token"
+        required: true
+        type: string
+      symbols:
+        description: "Comma-separated symbols (e.g. R_10,R_25,R_50,R_100)"
+        required: false
+        default: "R_10,R_25,R_50,R_100"
+      tick_count:
+        description: "Historical ticks to fetch per symbol"
+        required: false
+        default: "5000"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/deriv-bot-strategy-test-5fimbw
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt -q
+
+      - name: Run backtest against Deriv demo API
+        env:
+          DERIV_API_TOKEN: ${{ inputs.api_token }}
+        run: python backtest.py
