@@ -1,0 +1,27 @@
+{
+  "downloaded_pdf": [],
+  "downloaded_text_pdf": [],
+  "saved_html_bundle": [],
+  "skipped_exists": [],
+  "not_found": [],
+  "blocked_403": [
+    "Basic Mathematics — Form 1",
+    "Basic Mathematics — Form 2",
+    "Biology — Form 1",
+    "Biology — Form 2",
+    "Chemistry — Form 1",
+    "Chemistry — Form 2",
+    "Civics — Form 1",
+    "Civics — Form 2",
+    "English Language — Form 1",
+    "English Language — Form 2",
+    "Geography — Form 1",
+    "Geography — Form 2",
+    "History — Form 1",
+    "History — Form 2",
+    "Kiswahili — Form 1",
+    "Kiswahili — Form 2",
+    "Physics — Form 1",
+    "Physics — Form 2"
+  ]
+}
